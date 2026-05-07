@@ -1,0 +1,23 @@
+[project]
+name = "rfq-drawing-extractor-agent"
+version = "0.1.0"
+description = "Standalone RFQ engineering PDF extraction demo agent"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "boto3>=1.39.0",
+    "pdfplumber>=0.11.0",
+    "pydantic>=2.11.0",
+    "pymupdf>=1.24.0",
+    "python-dotenv>=1.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
