@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .models import PageDetectionResult, PageExtraction, RawExtractionResult, TableExtraction, WordBox
-from .normalization import normalize_text
+from .models import PageDetectionResult, PageExtraction, RawExtractionResult, TableExtraction, TextLine, WordBox
+from .normalization import normalize_reconstructed_text, normalize_text
 from .textract_ocr import analyze_page_with_textract
 
 
@@ -44,6 +44,7 @@ def extract_raw_content(pdf_path: Path, detection: PageDetectionResult) -> RawEx
                     textract_lines = ocr.lines
                 warnings.extend(ocr.warnings)
 
+            reconstructed_lines = _reconstruct_lines(words, page_detection.page_number)
             pages.append(
                 PageExtraction(
                     page_number=page_detection.page_number,
@@ -54,6 +55,7 @@ def extract_raw_content(pdf_path: Path, detection: PageDetectionResult) -> RawEx
                     page_width=float(page.width),
                     page_height=float(page.height),
                     words=words,
+                    reconstructed_lines=reconstructed_lines,
                     tables=tables,
                     textract_lines=textract_lines,
                     warnings=warnings,
@@ -108,6 +110,101 @@ def _extract_tables(page: object, page_number: int) -> list[TableExtraction]:
     return tables
 
 
+def _reconstruct_lines(words: list[WordBox], page_number: int) -> list[TextLine]:
+    if not words:
+        return []
+
+    heights = [max(0.1, word.bottom - word.top) for word in words]
+    median_height = sorted(heights)[len(heights) // 2]
+    line_tolerance = max(2.0, median_height * 0.55)
+
+    groups: list[list[WordBox]] = []
+    for word in sorted(words, key=lambda item: (item.top, item.x0)):
+        target_group = None
+        for group in groups:
+            group_top = sum(item.top for item in group) / len(group)
+            if abs(word.top - group_top) <= line_tolerance:
+                target_group = group
+                break
+        if target_group is None:
+            groups.append([word])
+        else:
+            target_group.append(word)
+
+    lines: list[TextLine] = []
+    for group in groups:
+        ordered = sorted(group, key=lambda item: item.x0)
+        text = _join_line_words(ordered)
+        normalized_text, warnings = normalize_reconstructed_text(text)
+        if not normalized_text:
+            continue
+        lines.append(
+            TextLine(
+                text=text,
+                normalized_text=normalized_text,
+                x0=min(item.x0 for item in ordered),
+                top=min(item.top for item in ordered),
+                x1=max(item.x1 for item in ordered),
+                bottom=max(item.bottom for item in ordered),
+                page=page_number,
+                source="text",
+                confidence=min(item.confidence for item in ordered),
+                warnings=warnings,
+            )
+        )
+    return sorted(lines, key=lambda line: (line.top, line.x0))
+
+
+def _join_line_words(words: list[WordBox]) -> str:
+    if not words:
+        return ""
+    if _looks_like_tracked_text(words):
+        return _join_tracked_words(words)
+
+    pieces = [words[0].text]
+    for previous, current in zip(words, words[1:], strict=False):
+        gap = current.x0 - previous.x1
+        if gap <= 0.8 and _join_without_space(previous.text, current.text):
+            pieces[-1] += current.text
+        else:
+            pieces.append(current.text)
+    return " ".join(pieces)
+
+
+def _looks_like_tracked_text(words: list[WordBox]) -> bool:
+    letterish = [word for word in words if len(word.text) <= 2 and word.text.replace(".", "").isalpha()]
+    if len(letterish) < 8 or len(letterish) / len(words) < 0.75:
+        return False
+    return max(word.bottom for word in words) - min(word.top for word in words) <= 12
+
+
+def _join_tracked_words(words: list[WordBox]) -> str:
+    clusters: list[str] = []
+    current = words[0].text
+    gaps = [max(0.0, current_word.x0 - previous_word.x1) for previous_word, current_word in zip(words, words[1:], strict=False)]
+    median_gap = sorted(gaps)[len(gaps) // 2] if gaps else 0.0
+    break_gap = max(1.8, median_gap * 1.7)
+    for previous, word in zip(words, words[1:], strict=False):
+        gap = word.x0 - previous.x1
+        if gap > break_gap or previous.text.endswith(","):
+            clusters.append(current)
+            current = word.text
+        else:
+            current += word.text
+    clusters.append(current)
+    return " ".join(clusters)
+
+
+def _join_without_space(previous: str, current: str) -> bool:
+    if previous.endswith(("/", "-", "±", "Ø")):
+        return True
+    if current in {".", ",", ":", ";", ")", "\"", "°"}:
+        return True
+    if current.startswith((".", ",", ":", ";", ")", "\"", "°")):
+        return True
+    return False
+
+
 def _native_content_is_incomplete(text: str, tables: list[TableExtraction]) -> bool:
     if len(text) < 100:
         return True
@@ -124,4 +221,3 @@ def _merge_text(first: str, second: str) -> str:
     if second.strip() in first:
         return first.strip()
     return first.strip() + "\n" + second.strip()
-

@@ -7,6 +7,7 @@ from .models import (
     BomComponent,
     ConnectionCandidate,
     DimensionCandidate,
+    EngineeringTable,
     ExtractedField,
     RawExtractionResult,
     StructuredEngineeringData,
@@ -33,7 +34,7 @@ PROCESS_KEYWORDS = (
     "inspection",
 )
 
-STANDARD_RE = re.compile(r"\b(?:ASME\s+Y14\.5|ISO\s+1101|ISO\s+2768|ISO\s+\d+|ASTM\s+[A-Z]\d+)\b", re.I)
+STANDARD_RE = re.compile(r"\b(?:ASME[-\s]*Y14\.5M?|ISO\s+1101|ISO\s+2768|ISO\s+\d+|ASTM\s+[A-Z]\d+)\b", re.I)
 TOLERANCE_RE = re.compile(r"(?:±|\+/-)\s*\d+(?:\.\d+)?|\b\d+(?:\.\d+)?\s*(?:MAX|MIN)\b", re.I)
 SURFACE_RE = re.compile(r"\bR[az]\s*\d+(?:\.\d+)?\b", re.I)
 CONNECTION_RE = re.compile(
@@ -43,17 +44,22 @@ CONNECTION_RE = re.compile(
 DIMENSION_PAIR_RE = re.compile(r"(?P<metric>\d{1,4}(?:\.\d+)?)\s*\((?P<imperial>\d{1,3}(?:\.\d+)?)\)")
 DIAMETER_RE = re.compile(r"(?P<count>\d+\s*-\s*)?Ø\s*(?P<value>\d+(?:\.\d+)?)", re.I)
 ANGLE_RE = re.compile(r"\b(?P<value>\d+(?:\.\d+)?)\s*°")
+INCH_DIMENSION_RE = re.compile(r"(?<![#A-Z])(?P<value>\d+\.\d+)(?!\s*[-A-Z0-9])")
+CHAMFER_RE = re.compile(r"\b(?P<count>\d+\s*x\s*)?(?P<size>\d+(?:\.\d+)?)\s*X\s*(?P<angle>\d+(?:\.\d+)?)\s*°", re.I)
+DEFAULT_TOLERANCE_RE = re.compile(r"(?P<precision>\.X{1,4})\s*(?P<tol>±\s*\d+(?:\.\d+)?)\s*\"?", re.I)
+Fcf_CANDIDATE_RE = re.compile(r"\b(?P<raw>(?:[a-z]{1,2}\.00\d[A-Z]?|[a-z]{1,2}Ø\.00\d[A-Z]?|\.002[A-Z]?))\b", re.I)
 
 
 def parse_engineering_data(raw: RawExtractionResult) -> StructuredEngineeringData:
     data = StructuredEngineeringData()
-    all_text = "\n".join(page.text for page in raw.pages if page.text)
-    all_lines = _lines(all_text)
+    all_text = _combined_text(raw)
+    all_lines = _combined_lines(raw)
 
     data.title_block = _parse_title_block(raw, all_lines)
     data.units = _parse_units(raw, all_text)
     data.drawing_type = _parse_drawing_type(raw, all_text)
     data.bom_components = _parse_bom_components(raw)
+    data.engineering_tables = _parse_engineering_tables(raw)
     data.dimensions = _parse_dimensions(raw)
     data.connections = _parse_connections(raw, data.bom_components)
     data.standards = _parse_standards(raw)
@@ -73,14 +79,16 @@ def refresh_semantic_summary(data: StructuredEngineeringData) -> None:
 def _parse_title_block(raw: RawExtractionResult, lines: list[str]) -> dict[str, ExtractedField]:
     fields: dict[str, ExtractedField] = {}
     text = "\n".join(lines)
+    label_values = _label_values_from_lines(lines)
+    label_values.update(_label_values_from_tables(raw))
 
     model = _first_match(
         [
             r"Hanbell Model\s*\n?\s*([A-Z0-9/&.-]+)",
-            r"\bModel\s*\n?\s*([A-Z0-9/&.-]+)",
+            r"\bModel\s*:?\s*\n?\s*([A-Z0-9/&.-]+)",
         ],
         text,
-    )
+    ) or label_values.get("model", "")
     if model:
         fields["model"] = _field(model, _evidence_for_value(raw, model), "high")
 
@@ -95,31 +103,60 @@ def _parse_title_block(raw: RawExtractionResult, lines: list[str]) -> dict[str, 
     if drawing_name:
         fields["drawing_name"] = _field(drawing_name, _evidence_for_value(raw, drawing_name), "high")
 
-    date = _first_match([r"\bDate\s*\n?\s*(\d{1,2}/\d{1,2}/\d{2,4})", r"\bDate\s*\n?\s*(\d{8})"], text)
+    date = _first_match([r"\bDate\s*:?\s*\n?\s*(\d{1,2}/\d{1,2}/\d{2,4})", r"\bDate\s*:?\s*\n?\s*(\d{8})"], text)
     if date:
         raw_date = date
         date = _format_compact_date(date)
         fields["date"] = _field(date, _evidence_for_value(raw, raw_date) or _evidence_for_value(raw, date), "high")
 
-    drawn_by = _first_match([r"\bDrawn By\s*\n?\s*([A-Z][A-Z0-9.-]{1,12})"], text)
+    drawn_by = label_values.get("drawn by", "") or _first_match([r"\bDrawn By\s*:?\s*\n?\s*([A-Z][A-Z0-9 .-]{1,40})"], text)
     if drawn_by:
+        drawn_by = re.split(r"\b(?:E-mail|Email|Tel|Fax)\b", drawn_by, maxsplit=1, flags=re.I)[0].strip()
         fields["drawn_by"] = _field(drawn_by, _evidence_for_value(raw, drawn_by), "high")
 
-    version = _first_match([r"\b(?:Ver\.?|Rev\.?|Revision)\s*([A-Z0-9.-]+)"], text)
+    version = _first_match([r"\b(?:Ver\.?|Rev\.?|Revision\b)\s*:?\s+([A-Z0-9.-]+)\b"], text)
+    if version and version.casefold() in {"isions", "revisions", "revision", "sheet"}:
+        version = ""
     if version:
         fields["revision_version"] = _field(version, _evidence_for_value(raw, version), "high")
 
     if re.search(r"\bHANBELL\b", text, re.I):
         fields["manufacturer"] = _field("HANBELL", _evidence_for_value(raw, "HANBELL"), "high")
 
-    company = _first_match([r"(Micro Control Systems,\s*Inc\.)"], text)
+    company = _first_match([r"(Micro Control Systems,\s*Inc\.)", r"(ADVANCED SENSOR TECHNOLOGY,\s*INC\.)"], text)
     if company:
         fields["company"] = _field(company, _evidence_for_value(raw, company), "high")
+
+    extra_fields = {
+        "drawing_number": ("dwg no.", "dwg no", "drawing no.", "drawing number"),
+        "created_date": ("created date",),
+        "approved_by": ("approved by",),
+        "approval_date": ("approval date",),
+        "item_number": ("item #", "item no.", "item number"),
+        "cage": ("cage",),
+        "sheet": ("sheet",),
+        "material": ("material",),
+    }
+    for field_name, labels in extra_fields.items():
+        if field_name in fields:
+            continue
+        value = next((label_values[label] for label in labels if label_values.get(label)), "")
+        if value:
+            fields[field_name] = _field(value, _evidence_for_value(raw, value), "high")
+
+    part_name = _part_name_from_tables(raw)
+    if part_name and "part_name" not in fields:
+        fields["part_name"] = _field(part_name, _evidence_for_value(raw, part_name), "medium")
+
+    if fields.get("material") and fields["material"].value.endswith(" COLD DRAW"):
+        fields["material"].value += "N"
 
     return fields
 
 
 def _parse_units(raw: RawExtractionResult, text: str) -> ExtractedField | None:
+    if re.search(r"\bALL DIMENSIONS ARE IN INCHES\b", text, re.I):
+        return _field("inch", _evidence_for_value(raw, "ALL DIMENSIONS ARE IN INCHES"), "high")
     if re.search(r"\bSI\s*:\s*mm\b", text, re.I) and re.search(r"Imperial\s*:\s*\(?in\)?", text, re.I):
         return _field("both", _evidence_for_value(raw, "UNIT"), "high")
     if re.search(r"\bmm\b", text, re.I) and re.search(r"\bin(?:ch|ches)?\b|\(in\)", text, re.I):
@@ -141,6 +178,8 @@ def _parse_drawing_type(raw: RawExtractionResult, text: str) -> ExtractedField:
         value = "outline drawing"
     elif "assembly" in lowered:
         value = "assembly drawing"
+    elif any(token in lowered for token in ("thread adapter", "material:", "all dimensions are in inches", "tolerance:")):
+        value = "part manufacturing drawing"
     elif "datasheet" in lowered or "data sheet" in lowered:
         value = "datasheet"
     else:
@@ -358,19 +397,70 @@ def _components_from_text(raw: RawExtractionResult) -> list[BomComponent]:
     return components
 
 
+def _parse_engineering_tables(raw: RawExtractionResult) -> list[EngineeringTable]:
+    tables: list[EngineeringTable] = []
+    for page in raw.pages:
+        for table in page.tables:
+            if not table.rows:
+                continue
+            headers = [cell.strip() for cell in table.rows[0]]
+            normalized_headers = [_normalize_header(header) for header in headers]
+            if _is_thread_or_item_chart(normalized_headers):
+                rows = []
+                for raw_row in table.rows[1:]:
+                    row = {}
+                    for header, value in zip(normalized_headers, raw_row, strict=False):
+                        if header:
+                            row[header] = value.strip()
+                    if any(row.values()):
+                        rows.append(row)
+                if rows:
+                    tables.append(
+                        EngineeringTable(
+                            table_type="thread_or_item_chart",
+                            headers=normalized_headers,
+                            rows=rows,
+                            page=page.page_number,
+                            confidence="high",
+                            evidence=" | ".join(headers),
+                        )
+                    )
+    return tables
+
+
+def _normalize_header(header: str) -> str:
+    normalized = re.sub(r"\s+", " ", header.strip().casefold())
+    aliases = {
+        "item #": "item_number",
+        "item no.": "item_number",
+        "item no": "item_number",
+        "chart#": "chart_number",
+        "chart #": "chart_number",
+        "thread size 't'": "thread_size",
+        "thread size": "thread_size",
+    }
+    return aliases.get(normalized, normalized.replace(" ", "_"))
+
+
+def _is_thread_or_item_chart(headers: list[str]) -> bool:
+    header_set = set(headers)
+    return "item_number" in header_set and ("thread_size" in header_set or "chart_number" in header_set)
+
+
 def _parse_dimensions(raw: RawExtractionResult) -> list[DimensionCandidate]:
     dimensions: list[DimensionCandidate] = []
     seen: set[tuple[float, str, float | None]] = set()
 
     for page in raw.pages:
-        for dimension in _dimension_rows(page.text, page.page_number):
+        page_text = _page_parse_text(page)
+        for dimension in _dimension_rows(page_text, page.page_number):
             key = (dimension.value, dimension.unit, dimension.imperial_value)
             if key in seen:
                 continue
             seen.add(key)
             dimensions.append(dimension)
 
-        for match in DIMENSION_PAIR_RE.finditer(page.text):
+        for match in DIMENSION_PAIR_RE.finditer(page_text):
             metric = float(match.group("metric"))
             imperial = float(match.group("imperial"))
             if not _valid_metric_imperial_pair(metric, imperial):
@@ -393,16 +483,35 @@ def _parse_dimensions(raw: RawExtractionResult) -> list[DimensionCandidate]:
                 )
             )
 
-        for match in DIAMETER_RE.finditer(page.text):
+        for match in CHAMFER_RE.finditer(page_text):
+            size = float(match.group("size"))
+            key = (size, "inch" if _page_uses_inches(page_text) else "unknown", None)
+            if key not in seen:
+                seen.add(key)
+                dimensions.append(
+                    DimensionCandidate(
+                        value=size,
+                        unit="inch" if _page_uses_inches(page_text) else "unknown",
+                        dimension_type="chamfer",
+                        role="chamfer",
+                        role_confidence="high",
+                        page=page.page_number,
+                        confidence="high",
+                        evidence=match.group(0),
+                    )
+                )
+
+        for match in DIAMETER_RE.finditer(page_text):
             value = float(match.group("value"))
-            key = (value, "mm", None)
+            unit = "inch" if _page_uses_inches(page_text) else "mm"
+            key = (value, unit, None)
             if key in seen:
                 continue
             seen.add(key)
             dimensions.append(
                 DimensionCandidate(
                     value=value,
-                    unit="mm",
+                    unit=unit,  # type: ignore[arg-type]
                     dimension_type="diameter",
                     role="hole_or_diameter",
                     role_confidence="medium",
@@ -412,7 +521,7 @@ def _parse_dimensions(raw: RawExtractionResult) -> list[DimensionCandidate]:
                 )
             )
 
-        for match in ANGLE_RE.finditer(page.text):
+        for match in ANGLE_RE.finditer(page_text):
             value = float(match.group("value"))
             key = (value, "degree", None)
             if key in seen:
@@ -423,6 +532,24 @@ def _parse_dimensions(raw: RawExtractionResult) -> list[DimensionCandidate]:
                     value=value,
                     unit="degree",
                     dimension_type="angle",
+                    page=page.page_number,
+                    confidence="medium",
+                    evidence=match.group(0),
+                )
+            )
+
+        for match in INCH_DIMENSION_RE.finditer(page_text):
+            value = float(match.group("value"))
+            if value > 10 or _inside_thread_or_tolerance_context(page_text, match.start()):
+                continue
+            key = (value, "inch", None)
+            if key in seen:
+                continue
+            seen.add(key)
+            dimensions.append(
+                DimensionCandidate(
+                    value=value,
+                    unit="inch",
                     page=page.page_number,
                     confidence="medium",
                     evidence=match.group(0),
@@ -537,7 +664,8 @@ def _normalize_connection_size(size: str) -> str:
 def _parse_standards(raw: RawExtractionResult) -> list[ExtractedField]:
     fields = []
     for page in raw.pages:
-        for match in STANDARD_RE.finditer(page.text):
+        page_text = _page_parse_text(page)
+        for match in STANDARD_RE.finditer(page_text):
             fields.append(_field(match.group(0), match.group(0), "high", page.page_number))
     return _dedupe_fields(fields)
 
@@ -545,11 +673,27 @@ def _parse_standards(raw: RawExtractionResult) -> list[ExtractedField]:
 def _parse_tolerances_gdnt(raw: RawExtractionResult) -> list[ExtractedField]:
     fields: list[ExtractedField] = []
     for page in raw.pages:
+        page_text = _page_parse_text(page)
         for regex in (STANDARD_RE, TOLERANCE_RE, SURFACE_RE):
-            for match in regex.finditer(page.text):
+            for match in regex.finditer(page_text):
                 fields.append(_field(match.group(0), match.group(0), "high", page.page_number))
 
-        if "⌖" in page.text:
+        for match in DEFAULT_TOLERANCE_RE.finditer(page_text):
+            fields.append(_field(f"{match.group('precision')} {match.group('tol')}\"", match.group(0), "high", page.page_number))
+
+        for match in Fcf_CANDIDATE_RE.finditer(page_text):
+            candidate_value, candidate_warnings = _gdnt_candidate_from_raw(match.group("raw"))
+            fields.append(
+                _field(
+                    candidate_value,
+                    match.group(0),
+                    "review",
+                    page.page_number,
+                    warnings=candidate_warnings,
+                )
+            )
+
+        if "⌖" in page_text:
             fields.append(
                 _field(
                     "position symbol candidate",
@@ -566,8 +710,12 @@ def _parse_tolerances_gdnt(raw: RawExtractionResult) -> list[ExtractedField]:
 def _parse_process_signals(raw: RawExtractionResult) -> list[ExtractedField]:
     fields = []
     for page in raw.pages:
-        lowered = page.text.casefold()
+        page_text = _page_parse_text(page)
+        fields.extend(_process_label_fields(page_text, page.page_number))
+        lowered = page_text.casefold()
         for keyword in PROCESS_KEYWORDS:
+            if keyword == "heat treat" and any(field.value == "heat treatment / finish: not specified" for field in fields):
+                continue
             if keyword in lowered:
                 fields.append(_field(keyword, _evidence_for_value(raw, keyword) or keyword, "high", page.page_number))
     return _dedupe_fields(fields)
@@ -577,7 +725,7 @@ def _parse_notes(raw: RawExtractionResult) -> list[ExtractedField]:
     notes = []
     seen: set[str] = set()
     for page in raw.pages:
-        for line in _lines(page.text):
+        for line in _page_parse_lines(page):
             lowered = line.casefold()
             if not any(token in lowered for token in ("option", "standard", "application", "service", "capacity")):
                 continue
@@ -589,7 +737,7 @@ def _parse_notes(raw: RawExtractionResult) -> list[ExtractedField]:
 
 
 def _parse_drawing_structure(raw: RawExtractionResult, data: StructuredEngineeringData) -> dict[str, object]:
-    text = "\n".join(page.text for page in raw.pages)
+    text = _combined_text(raw)
     return {
         "page_count": raw.page_count,
         "has_title_block": bool(data.title_block),
@@ -605,7 +753,12 @@ def _parse_drawing_structure(raw: RawExtractionResult, data: StructuredEngineeri
 
 def _build_semantic_summary(data: StructuredEngineeringData) -> str:
     model = data.title_block.get("model").value if data.title_block.get("model") else "unknown model"
-    manufacturer = data.title_block.get("manufacturer").value if data.title_block.get("manufacturer") else "unknown manufacturer"
+    if data.title_block.get("manufacturer"):
+        manufacturer = data.title_block["manufacturer"].value
+    elif data.title_block.get("company"):
+        manufacturer = data.title_block["company"].value
+    else:
+        manufacturer = "unknown manufacturer"
     drawing_type = data.drawing_type.value if data.drawing_type else "engineering PDF"
     units = data.units.value if data.units else "unknown units"
     categories = Counter(component.category or "component" for component in data.bom_components)
@@ -613,6 +766,7 @@ def _build_semantic_summary(data: StructuredEngineeringData) -> str:
     return (
         f"{manufacturer} {model} {drawing_type} with {units} units, "
         f"{len(data.bom_components)} parsed component entries, "
+        f"{len(data.engineering_tables)} engineering tables, "
         f"{len(data.dimensions)} dimension candidates, "
         f"{len(data.connections)} connection candidates"
         + (f", and component categories {category_summary}." if category_summary else ".")
@@ -623,8 +777,10 @@ def _warnings(raw: RawExtractionResult, data: StructuredEngineeringData) -> list
     warnings = list(raw.document_warnings)
     for page in raw.pages:
         warnings.extend(f"Page {page.page_number}: {warning}" for warning in page.warnings)
-    if not data.bom_components:
+    if not data.bom_components and not data.engineering_tables:
         warnings.append("No BOM/component rows were parsed.")
+    elif not data.bom_components and data.engineering_tables:
+        warnings.append("No BOM/component rows were parsed; non-BOM engineering tables were detected.")
     if not data.dimensions:
         warnings.append("No dimension candidates were parsed.")
     return warnings
@@ -686,6 +842,192 @@ def _callout_count(text: str) -> int:
     return len(set(re.findall(r"(?m)^\s*(\d{1,2})\s*$", text)))
 
 
+def _combined_text(raw: RawExtractionResult) -> str:
+    chunks: list[str] = []
+    for page in raw.pages:
+        chunks.append(_page_parse_text(page))
+    return "\n".join(chunk for chunk in chunks if chunk.strip())
+
+
+def _combined_lines(raw: RawExtractionResult) -> list[str]:
+    lines: list[str] = []
+    for page in raw.pages:
+        lines.extend(_page_parse_lines(page))
+    return lines
+
+
+def _page_parse_text(page: object) -> str:
+    text = getattr(page, "text", "") or ""
+    reconstructed = "\n".join(
+        line.normalized_text or line.text for line in getattr(page, "reconstructed_lines", []) if (line.normalized_text or line.text)
+    )
+    table_text = "\n".join(
+        " ".join(cell for cell in row if cell)
+        for table in getattr(page, "tables", [])
+        for row in table.rows
+    )
+    return "\n".join(part for part in (text, reconstructed, table_text) if part.strip())
+
+
+def _page_parse_lines(page: object) -> list[str]:
+    lines = _lines(getattr(page, "text", "") or "")
+    for line in getattr(page, "reconstructed_lines", []):
+        value = line.normalized_text or line.text
+        if value.strip():
+            lines.append(value.strip())
+    for table in getattr(page, "tables", []):
+        for row in table.rows:
+            value = " ".join(cell.strip() for cell in row if cell.strip())
+            if value:
+                lines.append(value)
+    return lines
+
+
+def _label_values_from_lines(lines: list[str]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    label_pattern = re.compile(
+        r"\b(?P<label>MODEL|DWG\s*No\.?|DRAWN BY|CREATED DATE|APPROVED BY|APPROVAL DATE|ITEM\s*#|CAGE|SHEET|MATERIAL)\s*:\s*(?P<value>[^|]+?)(?=\s{2,}|\b(?:MODEL|DWG\s*No\.?|DRAWN BY|CREATED DATE|APPROVED BY|APPROVAL DATE|ITEM\s*#|CAGE|SHEET|MATERIAL)\s*:|$)",
+        re.I,
+    )
+    for line in lines:
+        for match in label_pattern.finditer(line):
+            label = _normalize_label(match.group("label"))
+            value = match.group("value").strip(" |")
+            if value:
+                values.setdefault(label, value)
+    return values
+
+
+def _label_values_from_tables(raw: RawExtractionResult) -> dict[str, str]:
+    values: dict[str, str] = {}
+    label_pattern = re.compile(r"^(?P<label>MODEL|DWG\s*No\.?|DRAWN BY|CREATED DATE|APPROVED BY|APPROVAL DATE|ITEM\s*#|CAGE|SHEET|MATERIAL)\s*:\s*(?P<value>.*)$", re.I)
+    for page in raw.pages:
+        for table in page.tables:
+            for row in table.rows:
+                for index, cell in enumerate(row):
+                    value = cell.strip()
+                    if not value:
+                        continue
+                    match = label_pattern.match(value)
+                    if match:
+                        parsed_value = match.group("value").strip()
+                        if not parsed_value and index + 1 < len(row):
+                            parsed_value = row[index + 1].strip()
+                        elif parsed_value and index + 1 < len(row):
+                            parsed_value = _complete_split_table_value(parsed_value, row[index + 1])
+                        if parsed_value:
+                            if _normalize_label(match.group("label")) == "material" and parsed_value.endswith(" COLD DRAW"):
+                                parsed_value += "N"
+                            values.setdefault(_normalize_label(match.group("label")), parsed_value)
+                        continue
+                    if ":" not in value and index + 1 < len(row):
+                        next_cell = row[index + 1].strip()
+                        joined = f"{value}: {next_cell}"
+                        joined_match = label_pattern.match(joined)
+                        if joined_match and next_cell:
+                            parsed_value = _complete_split_table_value(next_cell, row[index + 2] if index + 2 < len(row) else "")
+                            if _normalize_label(joined_match.group("label")) == "material" and parsed_value.endswith(" COLD DRAW"):
+                                parsed_value += "N"
+                            values.setdefault(_normalize_label(joined_match.group("label")), parsed_value)
+    return values
+
+
+def _normalize_label(label: str) -> str:
+    return re.sub(r"\s+", " ", label.strip().casefold()).rstrip(":")
+
+
+def _part_name_from_tables(raw: RawExtractionResult) -> str:
+    for page in raw.pages:
+        for table in page.tables:
+            for row in table.rows:
+                for cell in row:
+                    if re.search(r"\b(?:adapter|bracket|cover|housing|shaft|plate)\b", cell, re.I):
+                        value = re.sub(r"\s+", " ", cell.strip())
+                        value = re.sub(r"\s+[A-Z]$", "", value)
+                        if len(value) <= 80 and not value.casefold().startswith("material"):
+                            return value
+    return ""
+
+
+def _complete_split_table_value(value: str, next_cell: str) -> str:
+    next_value = next_cell.strip()
+    if not next_value:
+        return value
+    first_token = next_value.split()[0]
+    if re.fullmatch(r"[a-z]", first_token) and value[-1:].isalpha():
+        return value + first_token
+    if value.endswith("CHAR") and first_token == "T":
+        return "SEE CHART"
+    return value
+
+
+def _page_uses_inches(text: str) -> bool:
+    return bool(re.search(r"\bALL DIMENSIONS ARE IN INCHES\b|\binches\b", text, re.I))
+
+
+def _inside_thread_or_tolerance_context(text: str, position: int) -> bool:
+    context = text[max(0, position - 30) : position + 30].casefold()
+    return any(token in context for token in ("thread size", "m3x", "m6x", "#10", "#6", ".xxx", ".xxxx", "±"))
+
+
+def _process_label_fields(text: str, page_number: int) -> list[ExtractedField]:
+    fields: list[ExtractedField] = []
+    match = re.search(r"HEAT TREATMENT\s*-\s*FINISH\s*:\s*(?P<value>-|[^\n]+)?", text, re.I)
+    if match:
+        value = (match.group("value") or "").strip()
+        if not value or value == "-" or value.casefold().startswith("standard notes"):
+            fields.append(
+                _field(
+                    "heat treatment / finish: not specified",
+                    match.group(0),
+                    "medium",
+                    page_number,
+                    warnings=["Process label is present, but no populated process requirement was found."],
+                )
+            )
+        else:
+            fields.append(_field(f"heat treatment / finish: {value}", match.group(0), "high", page_number))
+    return fields
+
+
+def _gdnt_candidate_from_raw(raw_value: str) -> tuple[str, list[str]]:
+    raw = raw_value.strip()
+    compact = raw.replace("Ø", "n")
+    warnings = ["GD&T symbol was decoded through a CAD/PDF font artifact; normalized meaning requires review."]
+
+    artifact_map = {
+        "c": ("flatness", "▱"),
+        "b": ("perpendicularity", "⊥"),
+        "j": ("position", "⌖"),
+    }
+    symbol_code = ""
+    tolerance_text = raw
+    datum = ""
+    diameter = False
+
+    match = re.match(r"(?P<code>[a-z]{1,2})(?P<tolerance>\.00\d)(?P<datum>[A-Z]?)$", compact, re.I)
+    if match:
+        code = match.group("code").casefold()
+        symbol_code = code[0]
+        diameter = len(code) > 1 and "n" in code[1:]
+        tolerance_text = match.group("tolerance")
+        datum = match.group("datum")
+    else:
+        match = re.match(r"(?P<tolerance>\.00\d)(?P<datum>[A-Z]?)$", compact, re.I)
+        if match:
+            tolerance_text = match.group("tolerance")
+            datum = match.group("datum")
+
+    characteristic, symbol = artifact_map.get(symbol_code, ("unknown GD&T characteristic", "[symbol]"))
+    diameter_prefix = "Ø" if diameter else ""
+    datum_suffix = f" {datum}" if datum else ""
+    normalized = f"{symbol} {diameter_prefix}{tolerance_text}{datum_suffix}".strip()
+    return (
+        f"feature control frame candidate: {characteristic} {normalized} (raw: {raw})",
+        warnings,
+    )
+
+
 def _field(
     value: str,
     evidence: str,
@@ -732,7 +1074,7 @@ def _evidence_for_value(raw: RawExtractionResult, value: str) -> str:
         return ""
     pattern = re.compile(re.escape(value), re.I)
     for page in raw.pages:
-        lines = _lines(page.text)
+        lines = _page_parse_lines(page)
         for index, line in enumerate(lines):
             if pattern.search(line):
                 context = lines[max(0, index - 1) : min(len(lines), index + 2)]
@@ -745,7 +1087,7 @@ def _page_for_value(raw: RawExtractionResult, value: str) -> int | None:
         return None
     pattern = re.compile(re.escape(value), re.I)
     for page in raw.pages:
-        if pattern.search(page.text):
+        if pattern.search(_page_parse_text(page)):
             return page.page_number
     return None
 

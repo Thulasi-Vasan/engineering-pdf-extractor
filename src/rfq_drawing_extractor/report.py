@@ -36,6 +36,7 @@ def build_markdown_report(result: ExtractionRunResult) -> str:
     lines.extend(_field_section("Drawing Type", [data.drawing_type] if data.drawing_type else []))
     lines.extend(_field_section("Units", [data.units] if data.units else []))
     lines.extend(_components_section(data))
+    lines.extend(_engineering_tables_section(data))
     lines.extend(_dimensions_section(data))
     lines.extend(_overall_envelope_section(data))
     lines.extend(_connections_section(data))
@@ -90,6 +91,24 @@ def _components_section(data: StructuredEngineeringData) -> list[str]:
             f"{item.confidence} | {_escape(item.evidence)} |"
         )
     lines.append("")
+    return lines
+
+
+def _engineering_tables_section(data: StructuredEngineeringData) -> list[str]:
+    lines = ["### Engineering Tables", ""]
+    if not data.engineering_tables:
+        return lines + ["No non-BOM engineering tables parsed.", ""]
+    for table in data.engineering_tables[:20]:
+        lines.extend([f"#### {table.table_type}", ""])
+        if not table.rows:
+            lines.extend(["No rows parsed.", ""])
+            continue
+        headers = table.headers or list(table.rows[0].keys())
+        lines.append("| " + " | ".join(headers) + " |")
+        lines.append("|" + "|".join("---" for _ in headers) + "|")
+        for row in table.rows[:80]:
+            lines.append("| " + " | ".join(_escape(row.get(header, "")) for header in headers) + " |")
+        lines.append("")
     return lines
 
 

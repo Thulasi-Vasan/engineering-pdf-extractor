@@ -11,7 +11,7 @@ PageType = Literal["text_page", "image_page", "hybrid_page", "empty_or_unknown_p
 PdfType = Literal["text_vector_pdf", "scanned_image_pdf", "hybrid_pdf", "unreadable_pdf"]
 ExtractionMethod = Literal["text", "ocr", "mixed", "none"]
 SourceType = Literal["text", "ocr", "mixed", "inferred", "vision_llm"]
-ConfidenceLabel = Literal["high", "medium", "low"]
+ConfidenceLabel = Literal["high", "medium", "low", "review"]
 
 
 class RunMetadata(BaseModel):
@@ -83,6 +83,19 @@ class TextractLine(BaseModel):
     height: float
 
 
+class TextLine(BaseModel):
+    text: str
+    normalized_text: str = ""
+    x0: float
+    top: float
+    x1: float
+    bottom: float
+    page: int | None = None
+    source: Literal["text", "ocr", "mixed"] = "text"
+    confidence: float = 1.0
+    warnings: list[str] = Field(default_factory=list)
+
+
 class PageExtraction(BaseModel):
     page_number: int
     page_type: PageType
@@ -92,6 +105,7 @@ class PageExtraction(BaseModel):
     page_width: float
     page_height: float
     words: list[WordBox] = Field(default_factory=list)
+    reconstructed_lines: list[TextLine] = Field(default_factory=list)
     tables: list[TableExtraction] = Field(default_factory=list)
     textract_lines: list[TextractLine] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
@@ -153,6 +167,17 @@ class ConnectionCandidate(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class EngineeringTable(BaseModel):
+    table_type: str
+    headers: list[str] = Field(default_factory=list)
+    rows: list[dict[str, str]] = Field(default_factory=list)
+    source: SourceType = "text"
+    page: int | None = None
+    confidence: ConfidenceLabel = "medium"
+    evidence: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
 class EnvelopeAxisMeasurement(BaseModel):
     value: float | None = None
     unit: Literal["mm", "inch", "unknown"] = "unknown"
@@ -194,6 +219,7 @@ class StructuredEngineeringData(BaseModel):
     units: ExtractedField | None = None
     standards: list[ExtractedField] = Field(default_factory=list)
     bom_components: list[BomComponent] = Field(default_factory=list)
+    engineering_tables: list[EngineeringTable] = Field(default_factory=list)
     dimensions: list[DimensionCandidate] = Field(default_factory=list)
     connections: list[ConnectionCandidate] = Field(default_factory=list)
     notes: list[ExtractedField] = Field(default_factory=list)

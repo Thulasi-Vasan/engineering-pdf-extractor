@@ -264,6 +264,17 @@ CHAMFER: ± 5°
   - Use symbol normalization and vector-frame detection before classifying GD&T.
   - Emit uncertain GD&T rows as `confidence: review` instead of dropping them.
 
+### Future Hardening: Validate GD&T symbols beyond text-artifact mapping
+
+- Current status: GD&T-like text artifacts such as `c.002`, `bn.002B`, and `j.002A` can be mapped to likely symbol candidates, but this is heuristic and should remain `review` confidence.
+- Why this matters: custom CAD/PDF font encodings may map letters like `b`, `c`, or `j` differently in other drawings, so text-only mapping is not enough for high-confidence GD&T extraction.
+- Stronger future fixes:
+  - Inspect actual embedded font/glyph maps when available to decode CAD symbols more reliably.
+  - Use vector geometry to detect feature-control-frame boxes and symbol cells.
+  - Crop GD&T frame regions and send them to OCR/vision model for symbol confirmation.
+  - Combine text artifact, vector frame shape, and vision result before assigning high confidence.
+  - Keep the current heuristic as fallback, but only promote to high confidence when at least one independent validation path agrees.
+
 ### Issue 13: Process requirement parser overstates heat treatment/finish label
 
 - File checked: `outputs/MCP02498/structured_engineering_data.json`

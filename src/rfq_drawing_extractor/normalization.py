@@ -35,6 +35,8 @@ def normalize_text(text: str) -> str:
     normalized = normalized.replace("UNlT", "UNIT")
     normalized = _restore_common_pdf_spacing(normalized)
     normalized = _restore_common_fraction_sizes(normalized)
+    normalized = normalize_engineering_symbol_artifacts(normalized)
+    normalized = _collapse_overprinted_words(normalized)
 
     cleaned_lines = []
     for line in normalized.splitlines():
@@ -42,6 +44,60 @@ def normalize_text(text: str) -> str:
         if line:
             cleaned_lines.append(line)
     return "\n".join(cleaned_lines)
+
+
+def normalize_reconstructed_text(text: str) -> tuple[str, list[str]]:
+    warnings: list[str] = []
+    normalized = normalize_text(text)
+    deduped = _collapse_overprinted_words(normalized)
+    if deduped != normalized:
+        warnings.append("Collapsed repeated/overprinted character runs.")
+        normalized = deduped
+    return normalized, warnings
+
+
+def normalize_engineering_symbol_artifacts(text: str) -> str:
+    normalized = text
+    normalized = _normalize_tolerance_symbol_artifacts(normalized)
+    normalized = _normalize_diameter_artifacts(normalized)
+    return normalized
+
+
+def _normalize_tolerance_symbol_artifacts(text: str) -> str:
+    normalized = text
+    normalized = re.sub(r"`\s*(?=\d|\.)", "±", normalized)
+    normalized = re.sub(r"(?<=\d)\s*~", "°", normalized)
+    normalized = re.sub(r"(?<=/\d)\s*~", "°", normalized)
+    return normalized
+
+
+def _normalize_diameter_artifacts(text: str) -> str:
+    normalized = text
+    normalized = re.sub(r"\bn(?=\d+(?:\.\d+)?)", "Ø", normalized)
+    normalized = re.sub(r"\bn(?=\.\d+)", "Ø", normalized)
+    return normalized
+
+
+def _collapse_overprinted_words(text: str) -> str:
+    return re.sub(r"\b[A-Za-z]{4,}\b", lambda match: _collapse_repeated_word(match.group(0)), text)
+
+
+def _collapse_repeated_word(word: str) -> str:
+    runs = re.findall(r"([A-Za-z])\1*", word)
+    if len(runs) < 3:
+        if len(runs) >= 2 and all(len(match.group(0)) >= 2 for match in re.finditer(r"([A-Za-z])\1*", word)):
+            return "".join(runs)
+        return word
+    run_lengths = [len(match.group(0)) for match in re.finditer(r"([A-Za-z])\1*", word)]
+    if not run_lengths:
+        return word
+    repeated_runs = sum(1 for length in run_lengths if length >= 2)
+    if repeated_runs / len(run_lengths) < 0.6:
+        return word
+    collapsed = "".join(runs)
+    if len(collapsed) < 3:
+        return word
+    return collapsed
 
 
 def text_preview(text: str, *, limit: int = 240) -> str:
