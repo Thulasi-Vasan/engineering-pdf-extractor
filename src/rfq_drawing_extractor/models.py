@@ -144,10 +144,17 @@ class BomComponent(BaseModel):
 class DimensionCandidate(BaseModel):
     value: float
     unit: Literal["mm", "inch", "degree", "unknown"] = "unknown"
+    secondary_value: float | None = None
     imperial_value: float | None = None
     dimension_type: str = "linear"
+    quantity: int | None = None
+    angle_value: float | None = None
+    angle_unit: Literal["degree", "unknown"] = "unknown"
     role: str = "unknown"
     role_confidence: ConfidenceLabel = "low"
+    raw_callout: str = ""
+    normalized_callout: str = ""
+    region_id: str = ""
     source: SourceType = "text"
     page: int | None = None
     confidence: ConfidenceLabel = "medium"
@@ -174,6 +181,37 @@ class EngineeringTable(BaseModel):
     source: SourceType = "text"
     page: int | None = None
     confidence: ConfidenceLabel = "medium"
+    evidence: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ThreadRequirement(BaseModel):
+    thread_size: str = ""
+    pitch: float | None = None
+    thread_class: str = ""
+    quantity: int | None = None
+    minimum_full_threads: int | None = None
+    label: str = ""
+    relief_note: str = ""
+    source: SourceType = "text"
+    page: int | None = None
+    region_id: str = ""
+    confidence: ConfidenceLabel = "medium"
+    evidence: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
+class DrawingRegion(BaseModel):
+    region_id: str
+    page: int
+    region_type: str
+    label: str = ""
+    x0: float | None = None
+    top: float | None = None
+    x1: float | None = None
+    bottom: float | None = None
+    source: SourceType = "inferred"
+    confidence: ConfidenceLabel = "low"
     evidence: str = ""
     warnings: list[str] = Field(default_factory=list)
 
@@ -220,12 +258,15 @@ class StructuredEngineeringData(BaseModel):
     standards: list[ExtractedField] = Field(default_factory=list)
     bom_components: list[BomComponent] = Field(default_factory=list)
     engineering_tables: list[EngineeringTable] = Field(default_factory=list)
+    thread_requirements: list[ThreadRequirement] = Field(default_factory=list)
     dimensions: list[DimensionCandidate] = Field(default_factory=list)
     connections: list[ConnectionCandidate] = Field(default_factory=list)
     notes: list[ExtractedField] = Field(default_factory=list)
+    drawing_regions: list[DrawingRegion] = Field(default_factory=list)
     drawing_structure: dict[str, Any] = Field(default_factory=dict)
     tolerances_gdnt: list[ExtractedField] = Field(default_factory=list)
     process_requirements: list[ExtractedField] = Field(default_factory=list)
+    manufacturing_requirements: list[ExtractedField] = Field(default_factory=list)
     overall_envelope: OverallEnvelope = Field(default_factory=OverallEnvelope)
     semantic_summary: str = ""
     warnings: list[str] = Field(default_factory=list)

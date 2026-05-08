@@ -2,6 +2,40 @@
 
 This file tracks findings from manually comparing generated extraction output against the source PDF. Use it for parser/OCR/vision issues that should be fixed later.
 
+## Issue Tracker
+
+Status meanings:
+
+- `fixed`: current output has the intended general behavior.
+- `partial`: improved, but still has known limitations or needs cleanup.
+- `open`: not implemented yet.
+- `future`: intentionally deferred hardening work.
+
+| Issue | Status | Area | Current Note |
+|---:|---|---|---|
+| 1 | partial | GD&T symbol extraction | GD&T candidates are captured, but symbol mapping is still review-confidence only. |
+| 2 | partial | CAD/PDF symbol normalization | Diameter artifacts improved; GD&T artifacts still need stronger validation. |
+| 3 | fixed | Text normalization | Repeated overprinted text is normalized in reconstructed lines. |
+| 4 | fixed | Text reconstruction | Spaced company text is recombined in reconstructed/normalized evidence. |
+| 5 | partial | Line reconstruction | Reconstructed lines help, but dense title/tolerance regions can still produce noisy evidence. |
+| 6 | partial | Tolerance symbols | Common tolerance artifacts are normalized and parsed; loose duplicate tolerance fragments/evidence noise still need cleanup. |
+| 7 | fixed | Title block parsing | MCP title fields now parse; cleanup tracked separately in Issue 14. |
+| 8 | fixed | Drawing type | MCP classifies as part manufacturing drawing. |
+| 9 | fixed | Standards | `ASME-Y14.5M` is parsed. |
+| 10 | fixed | Engineering tables | Thread/item chart is parsed as `engineering_tables`. |
+| 11 | partial | Dimensions | Chamfer/diameter/inch dimensions improved; more advanced association still needed. |
+| 12 | partial | GD&T/tolerances | Tolerance rows and GD&T candidates are emitted; GD&T remains review-confidence. |
+| 13 | partial | Process/manufacturing | Heat treatment/finish no longer over-confirmed; manufacturing cleanup still needs refinement. |
+| 14 | open | Title block cleanup | Need page numbers, focused evidence, and generic/specific date precedence. |
+| 15 | open | Schema design | Need a generic engineering requirement model so each new PDF type does not require a new top-level section. |
+| 16 | open | Engineering tables | Need generic table classification for multiple table types across different PDFs. |
+| 17 | open | Thread parsing | Need richer thread fields such as threads-per-inch, chart label linkage, and cleaner evidence. |
+| 18 | open | Vision dimension merge | Need safer merging between deterministic dimensions and Bedrock vision dimensions. |
+| 19 | open | View segmentation | Need real drawing view/region segmentation for PDFs with multiple diagrams on one page. |
+| 20 | future | GD&T validation | Need multi-signal GD&T confirmation using text artifacts, vector frames, cropped vision/OCR, and symbol dictionaries. |
+| 21 | open | Surface finish symbols | Need symbol-aware extraction for surface finish values like `63 or better`. |
+| 22 | open | Notes classification | Need to split noisy note blocks into standard/legal/manufacturing/tolerance note types. |
+
 ## MCP02498.pdf
 
 ### Issue 7: Structured title block parser misses MCP02498 fields and extracts false revision
@@ -553,3 +587,333 @@ TOLERANCE:
   - Apply normalization contextually near labels like `ANGLE`, `CHAMFER`, `TOLERANCE`, and known tolerance patterns.
   - Preserve original raw evidence plus normalized value fields.
   - Add structured tolerance rows for `.X`, `.XX`, `.XXX`, `.XXXX`, angle, and chamfer defaults.
+  - Suppress loose duplicate fragments like `±1`, `±5`, `±0.005` when they are already represented by structured default tolerance rows.
+  - Prefer focused evidence such as `ANGLE: ±1/2°` over wide noisy title-block/tolerance context.
+
+### Issue 14: Structured title block fields need generic page/evidence/date cleanup
+
+- File checked: `outputs/MCP02498/structured_engineering_data.json`
+- This is a **general parser issue**, not an MCP02498-specific issue.
+- Observed structured title block output is mostly correct, but has cleanup problems:
+  - Several fields have `"page": null` even though the evidence is from page 1.
+  - Generic `date` duplicates `created_date` when the drawing has a specific `CREATED DATE` label.
+  - Evidence snippets are too wide and include unrelated nearby title block/tolerance text.
+
+Observed examples:
+
+```json
+{
+  "date": {
+    "value": "8/26/2014",
+    "page": null,
+    "evidence": "REMOVE BURRS ... DRAWN BY: E. Pano CREATED DATE: 8/26/2014 | TOLERANCE:"
+  },
+  "created_date": {
+    "value": "8/26/2014",
+    "page": null,
+    "evidence": "REMOVE BURRS ... DRAWN BY: E. Pano CREATED DATE: 8/26/2014 | TOLERANCE:"
+  }
+}
+```
+
+- Expected generic behavior:
+  - If a value is extracted from a page, set that page number on the field.
+  - Do not create a generic `date` field from `CREATED DATE`, `APPROVAL DATE`, or other more specific labels unless the PDF has a real generic `Date` label.
+  - Keep evidence short and label-focused when possible, such as `MODEL: LRM200` or `DWG No.: FM3845`.
+- Impact:
+  - Validation is harder because evidence contains unrelated content.
+  - Downstream fingerprinting may treat duplicated date fields as separate metadata.
+  - Page-level traceability is weaker when `page` is null.
+- Future fix ideas:
+  - Make title-block parser return value plus page plus focused evidence from the exact matched line/table cell.
+  - Add label precedence: specific labels like `CREATED DATE` and `APPROVAL DATE` should not populate generic `date`.
+  - Use reconstructed line/table evidence first, then fall back to wider context only if exact evidence is unavailable.
+
+### Issue 15: Need generic engineering requirement schema for non-thread PDF requirements
+
+- File checked: `outputs/MCP02498/structured_engineering_data.json`
+- This is a **general schema design issue**, not an MCP02498-specific issue.
+- Current improvement added `thread_requirements`, which is useful for MCP02498 because that drawing has thread callouts and a thread chart.
+- But future engineering drawings may contain many other requirement types, such as:
+  - welding requirements
+  - casting/die casting requirements
+  - machining requirements
+  - coating/plating/finish requirements
+  - heat treatment requirements
+  - hardness requirements
+  - torque requirements
+  - adhesive/sealant requirements
+  - press-fit requirements
+  - inspection requirements
+  - hole/drill charts
+  - finish charts
+  - revision/change tables
+- Risk:
+  - If we add a new top-level section for every PDF-specific requirement type, the schema will become hard to maintain.
+  - New PDFs will keep forcing schema changes instead of fitting a general extraction model.
+- Expected generic direction:
+
+```json
+{
+  "engineering_requirements": [
+    {
+      "requirement_type": "thread",
+      "value": "M3x0.5 - 6g",
+      "parsed_fields": {
+        "thread_size": "M3",
+        "pitch": 0.5,
+        "thread_class": "6g",
+        "minimum_full_threads": 3
+      },
+      "page": 1,
+      "region_id": "page_1_thread_callout_area",
+      "confidence": "high",
+      "evidence": "M3x0.5 - 6g (MINIMUM 3 FULL THREADS)"
+    }
+  ]
+}
+```
+
+- Future fix ideas:
+  - Add a generic `engineering_requirements` list with `requirement_type`, `value`, `parsed_fields`, `page`, `region_id`, `source`, `confidence`, `evidence`, and `warnings`.
+  - Keep specialized sections like `thread_requirements` only as convenience views if needed.
+  - Feed known requirement parsers into the generic model first, then optionally project into specialized lists.
+  - Use generic requirement types such as `thread`, `finish`, `material`, `heat_treatment`, `coating`, `welding`, `casting`, `machining`, `assembly`, `inspection`, `torque`, `connection`, and `hole_chart`.
+
+### Issue 16: Need generic engineering table classification for different PDF table types
+
+- File checked: `outputs/MCP02498/structured_engineering_data.json`
+- This is a **general table parsing issue**, not an MCP02498-specific issue.
+- Current output correctly stores the MCP table as:
+
+```json
+{
+  "table_type": "thread_or_item_chart",
+  "headers": ["item_number", "chart_number", "thread_size"]
+}
+```
+
+- The MCP table is accurate, but future PDFs may contain many other table types, such as:
+  - BOM/component table
+  - thread chart
+  - hole/drill chart
+  - bolt chart
+  - finish/coating chart
+  - material/spec table
+  - tolerance table
+  - inspection table
+  - torque table
+  - revision table
+  - variant/configuration chart
+- Risk:
+  - Current table classification is too narrow.
+  - Unknown useful tables may be ignored or classified too generically.
+  - Multiple tables on the same page need stable `table_index`, `page`, and evidence so downstream parsers can use them safely.
+- Expected generic behavior:
+  - Store every useful table in `engineering_tables`.
+  - Classify table type using headers and table keywords.
+  - If uncertain, keep the table as `unknown_engineering_table` with `confidence: review`, instead of dropping it.
+  - Preserve page, table index, headers, rows, evidence, confidence, and warnings.
+- Future fix ideas:
+  - Add table type classifiers for `thread_chart`, `hole_chart`, `bolt_chart`, `revision_table`, `finish_table`, `material_table`, `tolerance_table`, `inspection_table`, and `torque_table`.
+  - Add `table_index` or stable table ID to `EngineeringTable`.
+  - Feed important rows into generic `engineering_requirements` after table classification.
+
+### Issue 17: Thread requirements need richer generic parsing fields and table linkage
+
+- File checked: `outputs/MCP02498/structured_engineering_data.json`
+- This is a **general thread parsing issue**, not an MCP02498-specific issue.
+- Current output captures thread requirements, including:
+
+```text
+M3x0.5 - 6g (MINIMUM 3 FULL THREADS)
+MCP02498 | -02 | #10-32 -2A
+```
+
+- Remaining limitations:
+  - Unified thread callouts like `#10-32 -2A` and `1/4-28 -2A` do not expose the `32` or `28` threads-per-inch value as a structured field.
+  - `THREAD 'T'` is captured as a review label, but it is not linked to the chart column `THREAD SIZE 'T'`.
+  - Local callout evidence can include neighboring dimension text like `0.000`.
+- Expected generic behavior:
+
+```json
+{
+  "thread_size": "#10",
+  "threads_per_inch": 32,
+  "thread_class": "2A",
+  "source_table": "thread_chart",
+  "chart_reference": "T",
+  "evidence": "#10-32 -2A"
+}
+```
+
+- Future fix ideas:
+  - Extend `ThreadRequirement` with `threads_per_inch`, `chart_reference`, and `source_table`.
+  - Parse unified thread forms as `major_size + threads_per_inch + class`.
+  - Link labels like `THREAD 'T'` to matching table headers like `THREAD SIZE 'T'`.
+  - Trim evidence to the actual callout span where possible.
+
+### Issue 18: Vision dimension merge can mix unrelated evidence into exact text dimensions
+
+- File checked: `outputs/MCP02498/structured_engineering_data.json`
+- This is a **general vision/parser merge issue**, not an MCP02498-specific issue.
+- Observed behavior:
+  - Deterministic parser extracts exact text dimensions like `2x 0.010 X 45°` and `Ø0.281`.
+  - Bedrock vision also returns nearby visual dimension candidates.
+  - Current merge logic can attach unrelated vision evidence to an already exact dimension.
+- Example:
+
+```text
+2x 0.010 X 45° | Vision: Line extending from 0.230 to 0.330 | ...
+```
+
+- Risk:
+  - Exact text dimensions become harder to validate.
+  - Vision may incorrectly merge local dimensions, thread values, or unrelated nearby values.
+  - Values like `M3` may be misinterpreted by vision as `3.0 mm thread_pitch`.
+- Expected generic behavior:
+  - Keep high-confidence exact text dimensions clean.
+  - Merge vision only when value, unit, dimension type, and nearby evidence clearly match.
+  - If vision finds a possible related value but the match is uncertain, keep it as a separate `review` candidate.
+  - Do not let vision overwrite deterministic exact values.
+- Future fix ideas:
+  - Add stricter merge rules by value, unit, type, evidence text, and region.
+  - Add warning when vision-only dimension is not grounded in raw text.
+  - Treat thread notation like `M3x0.5` with parser-first rules so vision does not misclassify `M3` as pitch.
+
+### Issue 19: Multiple drawing views/diagrams on one page need real view segmentation
+
+- Current output has basic `drawing_regions`, such as:
+  - `page_1_drawing_body`
+  - `page_1_title_block`
+  - `page_1_thread_callout_area`
+  - `page_1_tolerance_notes`
+  - `page_1_engineering_tables`
+- This is only a first step. It does **not** yet split separate drawing views such as:
+  - front view
+  - side view
+  - top view
+  - section view
+  - detail view
+  - exploded/detail diagrams
+- Risk:
+  - If a page has multiple diagrams, dimensions from one view can be associated with the wrong feature/view.
+  - Text/leader lines/GD&T from dense drawings can mix across regions.
+- Current first-pass region limitations observed in `outputs/MCP02498/structured_engineering_data.json`:
+  - `thread_callout_area` is too broad and overlaps much of the page/title block.
+  - `engineering_table_area` does not yet include table coordinates.
+  - Region overlap priority is not defined, so title block/table/notes/drawing body assignments can conflict.
+- Expected generic behavior:
+  - Detect separate view/diagram regions on each page.
+  - Assign dimensions, callouts, GD&T, notes, and leader-line text to a region before structured parsing.
+  - Keep title blocks, tables, and notes separate from drawing body regions.
+- Future fix ideas:
+  - Add `Flow 3.5: Drawing Region / View Segmentation`.
+  - Use coordinate clustering, PyMuPDF vector paths, view labels like `DETAIL A` / `SECTION A-A`, and optional Bedrock vision review.
+  - Add `region_id` and `region_type` to parsed dimensions, requirements, GD&T candidates, and notes.
+  - Add table bounding boxes when available.
+  - Add region priority rules such as `title_block > engineering_table > tolerance_notes > callout_area > drawing_body`.
+
+### Issue 20: GD&T symbols need multi-signal validation beyond native text extraction
+
+- Current behavior:
+  - pdfplumber/native text can extract GD&T symbol areas as artifacts like `c.002`, `bn.002B`, and `j.002A`.
+  - The parser maps these to review-confidence GD&T candidates.
+- This is not enough for high confidence because CAD/PDF font encodings can vary across drawings.
+- Expected robust approach:
+  - Use pdfplumber native text for raw text and word coordinates.
+  - Use PyMuPDF vector paths to detect feature-control-frame boxes and compartments.
+  - Crop the feature-control-frame region.
+  - Use Textract/Bedrock vision on the crop to confirm the visual symbol.
+  - Compare with a GD&T symbol dictionary.
+  - Upgrade confidence only when multiple signals agree.
+- Proposed confidence behavior:
+  - clean native symbol + valid frame context = `high`
+  - artifact text + valid frame + cropped vision agreement = `medium` or `high`
+  - artifact text only = `review`
+  - symbol alone without frame/tolerance/datum context = `review`
+- Useful future implementation pieces:
+  - `gdnt_frame_detector.py` using PyMuPDF `page.get_drawings()`
+  - cropped image generation around candidate frames
+  - `gdnt_symbol_dictionary`
+  - confidence scoring based on signal agreement
+
+### Issue 21: Surface finish symbol/value extraction misses embedded visual value
+
+- File checked: `outputs/MCP02498/structured_engineering_data.json`
+- PDF area checked: standard notes surface finish line.
+- Observed PDF text visually contains:
+
+```text
+SURFACE FINISH 63 OR BETTER
+```
+
+- Current structured output contains:
+
+```text
+finish requirement: SURFACE FINISH OR BETTER
+```
+
+- Actual issue:
+  - The parser captures the surface finish phrase.
+  - The value `63` is missed or not preserved.
+  - The `63` appears attached to a surface finish symbol/visual mark, so plain text extraction may not reliably capture it.
+- Expected generic behavior:
+
+```json
+{
+  "requirement_type": "surface_finish",
+  "value": "63 or better",
+  "source": "text_or_symbol",
+  "confidence": "medium",
+  "evidence": "SURFACE FINISH 63 OR BETTER"
+}
+```
+
+- Risk:
+  - Surface roughness/finish requirements are manufacturing-critical.
+  - Other PDFs may use surface finish symbols with values that are not cleanly represented in native text.
+- Future fix ideas:
+  - Add surface finish symbol/value detection.
+  - Use reconstructed text first, then crop the surface finish note region for OCR/vision if the value is missing.
+  - Add parser patterns for `SURFACE FINISH <value> OR BETTER`.
+  - Store this under generic `engineering_requirements` or `manufacturing_requirements` with requirement type `surface_finish`.
+
+### Issue 22: Notes output mixes legal, standard, manufacturing, and tolerance text
+
+- File checked: `outputs/MCP02498/structured_engineering_data.json`
+- Current `notes` output includes broad/noisy note blocks such as:
+
+```text
+HEAT TREATMENT - FINISH: STANDARD NOTES: (Unless Otherwise Specified) ...
+```
+
+and a large multi-line block containing:
+
+```text
+HEAT TREATMENT - FINISH
+STANDARD NOTES
+ANGLE
+ALL DIMENSIONS ARE IN INCHES
+ASME-Y14.5M
+SURFACE FINISH
+REMOVE BURRS
+TOLERANCE
+```
+
+- Actual issue:
+  - Different note types are mixed together.
+  - Legal/disclaimer text, standard notes, tolerance rows, and manufacturing notes should not all appear as one generic note.
+- Expected generic behavior:
+  - Split notes into typed categories, such as:
+    - `standard_notes`
+    - `legal_notes`
+    - `manufacturing_notes`
+    - `tolerance_notes`
+    - `inspection_notes`
+    - `general_notes`
+  - Preserve original evidence, but avoid duplicating notes that are already parsed into specific sections like `tolerances_gdnt` or `manufacturing_requirements`.
+- Future fix ideas:
+  - Add note classification by keywords and region.
+  - Deduplicate notes already represented as structured requirements.
+  - Keep long note blocks only when they cannot be split safely.

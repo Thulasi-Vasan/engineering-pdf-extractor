@@ -7,10 +7,12 @@ from .models import (
     BomComponent,
     ConnectionCandidate,
     DimensionCandidate,
+    DrawingRegion,
     EngineeringTable,
     ExtractedField,
     RawExtractionResult,
     StructuredEngineeringData,
+    ThreadRequirement,
 )
 
 
@@ -44,10 +46,16 @@ CONNECTION_RE = re.compile(
 DIMENSION_PAIR_RE = re.compile(r"(?P<metric>\d{1,4}(?:\.\d+)?)\s*\((?P<imperial>\d{1,3}(?:\.\d+)?)\)")
 DIAMETER_RE = re.compile(r"(?P<count>\d+\s*-\s*)?Ø\s*(?P<value>\d+(?:\.\d+)?)", re.I)
 ANGLE_RE = re.compile(r"\b(?P<value>\d+(?:\.\d+)?)\s*°")
-INCH_DIMENSION_RE = re.compile(r"(?<![#A-Z])(?P<value>\d+\.\d+)(?!\s*[-A-Z0-9])")
+INCH_DIMENSION_RE = re.compile(r"(?<![#A-Z])(?P<value>\d+\.\d+)(?![ \t]*-)")
 CHAMFER_RE = re.compile(r"\b(?P<count>\d+\s*x\s*)?(?P<size>\d+(?:\.\d+)?)\s*X\s*(?P<angle>\d+(?:\.\d+)?)\s*°", re.I)
+RANGE_RE = re.compile(r"(?<![#A-Z0-9])(?P<start>\.?\d+(?:\.\d+)?)\s*-\s*(?P<end>\.?\d+(?:\.\d+)?)(?!\s*[A-Z0-9])", re.I)
 DEFAULT_TOLERANCE_RE = re.compile(r"(?P<precision>\.X{1,4})\s*(?P<tol>±\s*\d+(?:\.\d+)?)\s*\"?", re.I)
+ANGLE_DEFAULT_TOLERANCE_RE = re.compile(r"\bANGLE\s*:?\s*(?P<tol>±\s*(?:\d+\s*/\s*\d+|\d+(?:\.\d+)?)\s*°?)", re.I)
+CHAMFER_DEFAULT_TOLERANCE_RE = re.compile(r"\bCHAMFER\s*:?\s*(?P<tol>±\s*(?:\d+\s*/\s*\d+|\d+(?:\.\d+)?)\s*°?)", re.I)
 Fcf_CANDIDATE_RE = re.compile(r"\b(?P<raw>(?:[a-z]{1,2}\.00\d[A-Z]?|[a-z]{1,2}Ø\.00\d[A-Z]?|\.002[A-Z]?))\b", re.I)
+METRIC_THREAD_RE = re.compile(r"\b(?P<size>M\d+(?:\.\d+)?)\s*x\s*(?P<pitch>\d+(?:\.\d+)?)\s*-\s*(?P<class>\d+[gGhH])\b")
+UNIFIED_THREAD_RE = re.compile(r"(?<!\w)(?P<size>(?:#\d+|\d+/\d+))-(?P<tpi>\d+)\s*-\s*(?P<class>\d+[AB])\b", re.I)
+MIN_FULL_THREADS_RE = re.compile(r"\bMIN(?:IMUM|\.)?\s*(?P<count>\d+)\s*FULL\s+THREADS?\b", re.I)
 
 
 def parse_engineering_data(raw: RawExtractionResult) -> StructuredEngineeringData:
@@ -60,11 +68,14 @@ def parse_engineering_data(raw: RawExtractionResult) -> StructuredEngineeringDat
     data.drawing_type = _parse_drawing_type(raw, all_text)
     data.bom_components = _parse_bom_components(raw)
     data.engineering_tables = _parse_engineering_tables(raw)
-    data.dimensions = _parse_dimensions(raw)
+    data.drawing_regions = _parse_drawing_regions(raw)
+    data.thread_requirements = _parse_thread_requirements(raw, data.engineering_tables, data.drawing_regions)
+    data.dimensions = _parse_dimensions(raw, data.drawing_regions)
     data.connections = _parse_connections(raw, data.bom_components)
     data.standards = _parse_standards(raw)
     data.tolerances_gdnt = _parse_tolerances_gdnt(raw)
     data.process_requirements = _parse_process_signals(raw)
+    data.manufacturing_requirements = _parse_manufacturing_requirements(raw, data.title_block)
     data.notes = _parse_notes(raw)
     data.drawing_structure = _parse_drawing_structure(raw, data)
     data.semantic_summary = _build_semantic_summary(data)
@@ -447,7 +458,254 @@ def _is_thread_or_item_chart(headers: list[str]) -> bool:
     return "item_number" in header_set and ("thread_size" in header_set or "chart_number" in header_set)
 
 
-def _parse_dimensions(raw: RawExtractionResult) -> list[DimensionCandidate]:
+def _parse_drawing_regions(raw: RawExtractionResult) -> list[DrawingRegion]:
+    regions: list[DrawingRegion] = []
+    for page in raw.pages:
+        regions.append(
+            DrawingRegion(
+                region_id=f"page_{page.page_number}_drawing_body",
+                page=page.page_number,
+                region_type="drawing_body",
+                label="drawing body",
+                x0=0,
+                top=0,
+                x1=page.page_width,
+                bottom=page.page_height,
+                confidence="low",
+                evidence="Default page drawing region.",
+            )
+        )
+        regions.extend(_regions_from_lines(page))
+        if page.tables:
+            regions.append(
+                DrawingRegion(
+                    region_id=f"page_{page.page_number}_engineering_tables",
+                    page=page.page_number,
+                    region_type="engineering_table_area",
+                    label="tables",
+                    confidence="medium",
+                    evidence="One or more native PDF tables were extracted on this page.",
+                )
+            )
+    return _dedupe_regions(regions)
+
+
+def _regions_from_lines(page: object) -> list[DrawingRegion]:
+    buckets: dict[str, list[object]] = {
+        "title_block": [],
+        "tolerance_notes": [],
+        "thread_callout_area": [],
+        "view_label_area": [],
+    }
+    for line in getattr(page, "reconstructed_lines", []):
+        text = (line.normalized_text or line.text or "").strip()
+        lowered = text.casefold()
+        if not text:
+            continue
+        if re.search(r"\b(?:model|dwg\s*no|drawn by|created date|approved by|material|cage|sheet)\s*:", text, re.I):
+            buckets["title_block"].append(line)
+        if any(token in lowered for token in ("tolerance", "asme", "chamfer:", "angle:", ".xx", ".xxx")):
+            buckets["tolerance_notes"].append(line)
+        if "thread" in lowered or METRIC_THREAD_RE.search(text) or UNIFIED_THREAD_RE.search(text):
+            buckets["thread_callout_area"].append(line)
+        if re.search(r"\b(?:detail|section|view)\s+[A-Z0-9-]+\b", text, re.I):
+            buckets["view_label_area"].append(line)
+
+    regions = []
+    page_number = getattr(page, "page_number", None)
+    for region_type, lines in buckets.items():
+        if not lines or page_number is None:
+            continue
+        x0, top, x1, bottom = _line_bbox(lines)
+        regions.append(
+            DrawingRegion(
+                region_id=f"page_{page_number}_{region_type}",
+                page=page_number,
+                region_type=region_type,
+                label=region_type.replace("_", " "),
+                x0=x0,
+                top=top,
+                x1=x1,
+                bottom=bottom,
+                confidence="medium",
+                evidence=" | ".join((line.normalized_text or line.text).strip() for line in lines[:3]),
+            )
+        )
+    return regions
+
+
+def _line_bbox(lines: list[object]) -> tuple[float, float, float, float]:
+    return (
+        min(float(getattr(line, "x0", 0.0)) for line in lines),
+        min(float(getattr(line, "top", 0.0)) for line in lines),
+        max(float(getattr(line, "x1", 0.0)) for line in lines),
+        max(float(getattr(line, "bottom", 0.0)) for line in lines),
+    )
+
+
+def _dedupe_regions(regions: list[DrawingRegion]) -> list[DrawingRegion]:
+    deduped: list[DrawingRegion] = []
+    seen: set[tuple[int, str]] = set()
+    for region in regions:
+        key = (region.page, region.region_type)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(region)
+    return deduped
+
+
+def _parse_thread_requirements(
+    raw: RawExtractionResult,
+    engineering_tables: list[EngineeringTable],
+    regions: list[DrawingRegion],
+) -> list[ThreadRequirement]:
+    requirements: list[ThreadRequirement] = []
+    seen: set[str] = set()
+
+    for page in raw.pages:
+        page_text = _page_parse_text(page)
+        for requirement in _thread_requirements_from_text(page_text, page.page_number, regions):
+            key = _thread_requirement_key(requirement)
+            if key not in seen:
+                seen.add(key)
+                requirements.append(requirement)
+
+    for table in engineering_tables:
+        for row in table.rows:
+            thread_size = row.get("thread_size", "").strip()
+            if not thread_size:
+                continue
+            item_number = row.get("item_number", "").strip()
+            chart_number = row.get("chart_number", "").strip()
+            evidence = " | ".join(part for part in (item_number, chart_number, thread_size) if part)
+            requirement = _thread_requirement_from_callout(
+                thread_size,
+                table.page,
+                evidence,
+                regions,
+                label="thread chart row",
+            )
+            if requirement is None:
+                continue
+            key = _thread_requirement_key(requirement)
+            if key not in seen:
+                seen.add(key)
+                requirements.append(requirement)
+
+    return requirements
+
+
+def _thread_requirement_key(requirement: ThreadRequirement) -> str:
+    return "|".join(
+        str(part).casefold()
+        for part in (
+            requirement.thread_size,
+            requirement.pitch,
+            requirement.thread_class,
+            requirement.minimum_full_threads,
+            requirement.label,
+            requirement.evidence if not requirement.thread_size else "",
+        )
+    )
+
+
+def _thread_requirements_from_text(text: str, page_number: int, regions: list[DrawingRegion]) -> list[ThreadRequirement]:
+    requirements: list[ThreadRequirement] = []
+    lines = _lines(text)
+    for index, line in enumerate(lines):
+        if re.match(r"^MCP\d+\s+-\d+\s+", line.strip(), re.I):
+            continue
+        if not _line_has_thread_requirement_signal(line):
+            continue
+        context = line
+        if index + 1 < len(lines) and MIN_FULL_THREADS_RE.search(lines[index + 1]):
+            context = f"{line} {lines[index + 1]}"
+        requirement = _thread_requirement_from_callout(context, page_number, context, regions)
+        if requirement is not None:
+            requirements.append(requirement)
+            continue
+        if re.search(r"\bTHREAD\s*['\"][A-Z0-9]+['\"]|\bMIN\.?\s+THREAD\s+RELIEF\b", line, re.I):
+            requirements.append(
+                ThreadRequirement(
+                    label=_clean_thread_label(line),
+                    relief_note=line if "relief" in line.casefold() else "",
+                    page=page_number,
+                    region_id=_region_id_for_evidence(regions, page_number, line),
+                    confidence="medium" if "relief" in line.casefold() else "review",
+                    evidence=line,
+                    warnings=[] if "relief" in line.casefold() else ["Thread label was found without a full thread size/class callout."],
+                )
+            )
+    return requirements
+
+
+def _line_has_thread_requirement_signal(line: str) -> bool:
+    lowered = line.casefold()
+    if METRIC_THREAD_RE.search(line) or UNIFIED_THREAD_RE.search(line):
+        return True
+    if re.search(r"\bTHREAD\s*['\"][A-Z0-9]+['\"]|\bMIN\.?\s+THREAD\s+RELIEF\b", line, re.I):
+        return True
+    if "thread size" in lowered and "thread adapter" not in lowered:
+        return True
+    return False
+
+
+def _thread_requirement_from_callout(
+    text: str,
+    page_number: int | None,
+    evidence: str,
+    regions: list[DrawingRegion],
+    *,
+    label: str = "",
+) -> ThreadRequirement | None:
+    metric_match = METRIC_THREAD_RE.search(text)
+    unified_match = UNIFIED_THREAD_RE.search(text)
+    if metric_match:
+        thread_size = metric_match.group("size").upper()
+        pitch = float(metric_match.group("pitch"))
+        thread_class = metric_match.group("class")
+        callout = metric_match.group(0)
+    elif unified_match:
+        thread_size = unified_match.group("size")
+        pitch = None
+        thread_class = unified_match.group("class").upper()
+        callout = unified_match.group(0)
+    else:
+        return None
+
+    min_threads_match = MIN_FULL_THREADS_RE.search(text)
+    relief_note = _first_thread_relief_note(text)
+    return ThreadRequirement(
+        thread_size=thread_size,
+        pitch=pitch,
+        thread_class=thread_class,
+        minimum_full_threads=int(min_threads_match.group("count")) if min_threads_match else None,
+        label=label or _clean_thread_label(text),
+        relief_note=relief_note,
+        page=page_number,
+        region_id=_region_id_for_evidence(regions, page_number, evidence),
+        confidence="high" if metric_match or unified_match else "medium",
+        evidence=evidence or callout,
+    )
+
+
+def _clean_thread_label(text: str) -> str:
+    match = re.search(r"\bTHREAD\s*['\"](?P<label>[A-Z0-9]+)['\"]", text, re.I)
+    if match:
+        value = (match.group("label") or "").strip()
+        return f"THREAD {value}".strip()
+    if re.search(r"\bTHREAD\s+SIZE\b", text, re.I):
+        return "THREAD SIZE"
+    return ""
+
+
+def _first_thread_relief_note(text: str) -> str:
+    match = re.search(r"\bMIN\.?\s+THREAD\s+RELIEF\s+ALLOWED\b", text, re.I)
+    return match.group(0) if match else ""
+
+
+def _parse_dimensions(raw: RawExtractionResult, regions: list[DrawingRegion]) -> list[DimensionCandidate]:
     dimensions: list[DimensionCandidate] = []
     seen: set[tuple[float, str, float | None]] = set()
 
@@ -477,6 +735,9 @@ def _parse_dimensions(raw: RawExtractionResult) -> list[DimensionCandidate]:
                     imperial_value=imperial,
                     role=role,
                     role_confidence=role_confidence,
+                    region_id=_region_id_for_evidence(regions, page.page_number, match.group(0)),
+                    raw_callout=match.group(0),
+                    normalized_callout=match.group(0),
                     page=page.page_number,
                     confidence="medium",
                     evidence=match.group(0),
@@ -485,16 +746,24 @@ def _parse_dimensions(raw: RawExtractionResult) -> list[DimensionCandidate]:
 
         for match in CHAMFER_RE.finditer(page_text):
             size = float(match.group("size"))
-            key = (size, "inch" if _page_uses_inches(page_text) else "unknown", None)
+            unit = "inch" if _page_uses_inches(page_text) else "unknown"
+            key = (size, unit, float(match.group("angle")))
             if key not in seen:
                 seen.add(key)
+                quantity = _quantity_from_prefix(match.group("count") or "")
                 dimensions.append(
                     DimensionCandidate(
                         value=size,
-                        unit="inch" if _page_uses_inches(page_text) else "unknown",
+                        unit=unit,  # type: ignore[arg-type]
                         dimension_type="chamfer",
+                        quantity=quantity,
+                        angle_value=float(match.group("angle")),
+                        angle_unit="degree",
                         role="chamfer",
                         role_confidence="high",
+                        raw_callout=match.group(0),
+                        normalized_callout=match.group(0),
+                        region_id=_region_id_for_evidence(regions, page.page_number, match.group(0)),
                         page=page.page_number,
                         confidence="high",
                         evidence=match.group(0),
@@ -513,8 +782,12 @@ def _parse_dimensions(raw: RawExtractionResult) -> list[DimensionCandidate]:
                     value=value,
                     unit=unit,  # type: ignore[arg-type]
                     dimension_type="diameter",
+                    quantity=_quantity_from_prefix(match.group("count") or ""),
                     role="hole_or_diameter",
                     role_confidence="medium",
+                    raw_callout=match.group(0),
+                    normalized_callout=match.group(0),
+                    region_id=_region_id_for_evidence(regions, page.page_number, match.group(0)),
                     page=page.page_number,
                     confidence="medium",
                     evidence=match.group(0),
@@ -522,6 +795,8 @@ def _parse_dimensions(raw: RawExtractionResult) -> list[DimensionCandidate]:
             )
 
         for match in ANGLE_RE.finditer(page_text):
+            if _inside_compound_or_default_tolerance_context(page_text, match.start()):
+                continue
             value = float(match.group("value"))
             key = (value, "degree", None)
             if key in seen:
@@ -532,15 +807,51 @@ def _parse_dimensions(raw: RawExtractionResult) -> list[DimensionCandidate]:
                     value=value,
                     unit="degree",
                     dimension_type="angle",
+                    raw_callout=match.group(0),
+                    normalized_callout=match.group(0),
+                    region_id=_region_id_for_evidence(regions, page.page_number, match.group(0)),
                     page=page.page_number,
                     confidence="medium",
                     evidence=match.group(0),
                 )
             )
 
+        for match in RANGE_RE.finditer(page_text):
+            if _inside_thread_or_tolerance_context(page_text, match.start()):
+                continue
+            if not _looks_like_range_dimension(match.group(0)):
+                continue
+            start = _float_from_possible_leading_decimal(match.group("start"))
+            end = _float_from_possible_leading_decimal(match.group("end"))
+            if end <= start:
+                continue
+            unit = "inch" if _page_uses_inches(page_text) else "unknown"
+            key = (start, unit, end)
+            if key in seen:
+                continue
+            seen.add(key)
+            dimensions.append(
+                DimensionCandidate(
+                    value=start,
+                    unit=unit,  # type: ignore[arg-type]
+                    secondary_value=end,
+                    dimension_type="range",
+                    role="range_dimension_or_allowance",
+                    role_confidence="medium",
+                    raw_callout=match.group(0),
+                    normalized_callout=match.group(0),
+                    region_id=_region_id_for_evidence(regions, page.page_number, match.group(0)),
+                    page=page.page_number,
+                    confidence="medium",
+                    evidence=match.group(0),
+                    warnings=["Range stored with lower value in value and upper value in secondary_value."],
+                )
+            )
+
         for match in INCH_DIMENSION_RE.finditer(page_text):
             value = float(match.group("value"))
-            if value > 10 or _inside_thread_or_tolerance_context(page_text, match.start()):
+            line_context = _line_at_position(page_text, match.start())
+            if value > 10 or _line_has_excluded_dimension_context(line_context):
                 continue
             key = (value, "inch", None)
             if key in seen:
@@ -550,6 +861,9 @@ def _parse_dimensions(raw: RawExtractionResult) -> list[DimensionCandidate]:
                 DimensionCandidate(
                     value=value,
                     unit="inch",
+                    raw_callout=match.group(0),
+                    normalized_callout=match.group(0),
+                    region_id=_region_id_for_evidence(regions, page.page_number, match.group(0)),
                     page=page.page_number,
                     confidence="medium",
                     evidence=match.group(0),
@@ -557,6 +871,27 @@ def _parse_dimensions(raw: RawExtractionResult) -> list[DimensionCandidate]:
             )
 
     return dimensions
+
+
+def _line_at_position(text: str, position: int) -> str:
+    start = text.rfind("\n", 0, position) + 1
+    end = text.find("\n", position)
+    if end == -1:
+        end = len(text)
+    return text[start:end].strip()
+
+
+def _line_has_excluded_dimension_context(line: str) -> bool:
+    lowered = line.casefold()
+    if not line:
+        return True
+    if any(token in lowered for token in ("thread size", "m3x", "m6x", "#10", "#6", ".xxx", ".xxxx", "±", "asme-y", "asme y", "fm3845.dwg")):
+        return True
+    if CHAMFER_RE.search(line):
+        return True
+    if re.search(r"\b(?:model|dwg\s*no|drawn by|created date|approved by|phone|fax|cage|sheet)\b", line, re.I):
+        return True
+    return False
 
 
 def _dimension_rows(text: str, page_number: int) -> list[DimensionCandidate]:
@@ -594,6 +929,50 @@ def _dimension_rows(text: str, page_number: int) -> list[DimensionCandidate]:
                 )
             )
     return dimensions
+
+
+def _quantity_from_prefix(value: str) -> int | None:
+    match = re.search(r"\d+", value or "")
+    return int(match.group(0)) if match else None
+
+
+def _float_from_possible_leading_decimal(value: str) -> float:
+    text = value.strip()
+    if text.startswith("."):
+        text = "0" + text
+    return float(text)
+
+
+def _looks_like_range_dimension(value: str) -> bool:
+    return bool(re.fullmatch(r"\.?\d+(?:\.\d+)?\s*-\s*\.?\d+(?:\.\d+)?", value.strip()))
+
+
+def _inside_compound_or_default_tolerance_context(text: str, position: int) -> bool:
+    context = text[max(0, position - 35) : position + 35].casefold()
+    return any(token in context for token in ("chamfer", "angle:", " x ", "±"))
+
+
+def _region_id_for_evidence(regions: list[DrawingRegion], page_number: int | None, evidence: str) -> str:
+    if page_number is None:
+        return ""
+    lowered = evidence.casefold()
+    if any(token in lowered for token in ("model:", "dwg no", "drawn by", "created date", "approved by", "material:", "cage:", "sheet:")):
+        preferred = "title_block"
+    elif any(token in lowered for token in ("tolerance", "asme", "±", ".xx", ".xxx", "chamfer:", "angle:")):
+        preferred = "tolerance_notes"
+    elif "thread" in lowered or METRIC_THREAD_RE.search(evidence) or UNIFIED_THREAD_RE.search(evidence):
+        preferred = "thread_callout_area"
+    elif any(token in lowered for token in ("item_number", "chart_number", "thread_size")):
+        preferred = "engineering_table_area"
+    else:
+        preferred = "drawing_body"
+    for region in regions:
+        if region.page == page_number and region.region_type == preferred:
+            return region.region_id
+    for region in regions:
+        if region.page == page_number and region.region_type == "drawing_body":
+            return region.region_id
+    return ""
 
 
 def _valid_metric_imperial_pair(metric: float, imperial: float) -> bool:
@@ -679,7 +1058,20 @@ def _parse_tolerances_gdnt(raw: RawExtractionResult) -> list[ExtractedField]:
                 fields.append(_field(match.group(0), match.group(0), "high", page.page_number))
 
         for match in DEFAULT_TOLERANCE_RE.finditer(page_text):
-            fields.append(_field(f"{match.group('precision')} {match.group('tol')}\"", match.group(0), "high", page.page_number))
+            fields.append(_field(f"default linear tolerance: {match.group('precision')} {match.group('tol')}\"", match.group(0), "high", page.page_number))
+
+        for match in ANGLE_DEFAULT_TOLERANCE_RE.finditer(page_text):
+            fields.append(_field(f"default angle tolerance: {match.group('tol')}", match.group(0), "high", page.page_number))
+
+        for match in CHAMFER_DEFAULT_TOLERANCE_RE.finditer(page_text):
+            fields.append(_field(f"default chamfer tolerance: {match.group('tol')}", match.group(0), "high", page.page_number))
+
+        fields.extend(_default_tolerances_from_lines(page))
+
+        for match in RANGE_RE.finditer(page_text):
+            context = page_text[max(0, match.start() - 45) : match.end() + 45]
+            if any(token in context.casefold() for token in ("sharp edges", "burrs", "break sharp", "remove burrs")):
+                fields.append(_field(f"default edge break range: {match.group(0)}", context.strip(), "high", page.page_number))
 
         for match in Fcf_CANDIDATE_RE.finditer(page_text):
             candidate_value, candidate_warnings = _gdnt_candidate_from_raw(match.group("raw"))
@@ -707,6 +1099,29 @@ def _parse_tolerances_gdnt(raw: RawExtractionResult) -> list[ExtractedField]:
     return _dedupe_fields(fields)
 
 
+def _default_tolerances_from_lines(page: object) -> list[ExtractedField]:
+    fields: list[ExtractedField] = []
+    lines = _page_parse_lines(page)
+    page_number = getattr(page, "page_number", None)
+    for index, line in enumerate(lines):
+        if len(line) > 80:
+            continue
+        is_angle_label = bool(re.match(r"^-?\s*ANGLE\s*:", line, re.I))
+        is_chamfer_label = bool(re.match(r"^-?\s*CHAMFER\s*:", line, re.I))
+        if not (is_angle_label or is_chamfer_label):
+            continue
+        context = " ".join(lines[index : min(len(lines), index + 4)])
+        match = re.search(r"±\s*(?:\d+\s*/\s*\d+|\d+(?:\.\d+)?)\s*°?", context)
+        if not match:
+            continue
+        if is_chamfer_label:
+            value = f"default chamfer tolerance: {match.group(0)}"
+        else:
+            value = f"default angle tolerance: {match.group(0)}"
+        fields.append(_field(value, context, "high", page_number))
+    return fields
+
+
 def _parse_process_signals(raw: RawExtractionResult) -> list[ExtractedField]:
     fields = []
     for page in raw.pages:
@@ -719,6 +1134,81 @@ def _parse_process_signals(raw: RawExtractionResult) -> list[ExtractedField]:
             if keyword in lowered:
                 fields.append(_field(keyword, _evidence_for_value(raw, keyword) or keyword, "high", page.page_number))
     return _dedupe_fields(fields)
+
+
+def _parse_manufacturing_requirements(
+    raw: RawExtractionResult,
+    title_block: dict[str, ExtractedField],
+) -> list[ExtractedField]:
+    fields: list[ExtractedField] = []
+    material = title_block.get("material")
+    if material:
+        fields.append(
+            _field(
+                f"material: {material.value}",
+                material.evidence or material.value,
+                material.confidence,
+                material.page,
+                warnings=material.warnings,
+            )
+        )
+
+    for page in raw.pages:
+        for line in _page_parse_lines(page):
+            if len(line) > 180:
+                continue
+            fields.extend(_manufacturing_label_fields(line, page.page_number))
+            lowered = line.casefold()
+            if not any(token in lowered for token in ("burr", "sharp edge", "finish", "plating", "coating", "machin", "cast", "weld", "inspection")):
+                continue
+            if any(token in lowered for token in ("standard notes", "phone:", "fax:", "approved by", "created date")):
+                if "remove burrs" not in lowered and "sharp edge" not in lowered:
+                    continue
+            fields.append(_field(_manufacturing_value_from_line(line), line, "medium", page.page_number))
+    return _dedupe_fields(fields)
+
+
+def _manufacturing_label_fields(text: str, page_number: int) -> list[ExtractedField]:
+    fields: list[ExtractedField] = []
+    label_pattern = re.compile(
+        r"\b(?P<label>HEAT TREATMENT|FINISH|SURFACE FINISH|PLATING|COATING)\s*:?\s*(?P<value>-|[^\n]+)?",
+        re.I,
+    )
+    for match in label_pattern.finditer(text):
+        label = re.sub(r"\s+", " ", match.group("label").strip().casefold())
+        value = (match.group("value") or "").strip()
+        if not value or value == "-" or value.casefold().startswith("standard notes"):
+            fields.append(
+                _field(
+                    f"{label}: not specified",
+                    match.group(0),
+                    "medium",
+                    page_number,
+                    warnings=["Manufacturing label is present, but no populated requirement was found."],
+                )
+            )
+        else:
+            fields.append(_field(f"{label}: {value}", match.group(0), "high", page_number))
+    return fields
+
+
+def _manufacturing_value_from_line(line: str) -> str:
+    value = re.sub(r"\s+", " ", line).strip()
+    value = re.split(r"\b(?:DRAWN BY|CREATED DATE|APPROVED BY|APPROVAL DATE|MODEL|DWG\s*No\.?)\b", value, maxsplit=1, flags=re.I)[0].strip(" :-")
+    value = value.replace("SURFACEFINISH ORBETTER", "SURFACE FINISH OR BETTER")
+    if re.search(r"\bburr", value, re.I):
+        return f"edge/burr requirement: {value}"
+    if re.search(r"\bfinish|plating|coating", value, re.I):
+        return f"finish requirement: {value}"
+    if re.search(r"\bmachin", value, re.I):
+        return f"machining requirement: {value}"
+    if re.search(r"\bcast", value, re.I):
+        return f"casting requirement: {value}"
+    if re.search(r"\bweld", value, re.I):
+        return f"welding requirement: {value}"
+    if re.search(r"\binspection", value, re.I):
+        return f"inspection requirement: {value}"
+    return value
 
 
 def _parse_notes(raw: RawExtractionResult) -> list[ExtractedField]:
@@ -742,12 +1232,16 @@ def _parse_drawing_structure(raw: RawExtractionResult, data: StructuredEngineeri
         "page_count": raw.page_count,
         "has_title_block": bool(data.title_block),
         "has_bom_table": bool(data.bom_components),
+        "has_engineering_tables": bool(data.engineering_tables),
+        "has_thread_requirements": bool(data.thread_requirements),
         "has_callout_balloons": _callout_count(text) >= 3,
         "callout_count_estimate": _callout_count(text),
         "has_outline_views": bool(data.drawing_type and "outline" in data.drawing_type.value),
         "has_exploded_views": "exploded" in text.casefold(),
         "has_gdnt_requirement_candidates": bool(data.tolerances_gdnt),
         "has_process_requirements": bool(data.process_requirements),
+        "has_manufacturing_requirements": bool(data.manufacturing_requirements),
+        "region_count": len(data.drawing_regions),
     }
 
 
@@ -767,6 +1261,7 @@ def _build_semantic_summary(data: StructuredEngineeringData) -> str:
         f"{manufacturer} {model} {drawing_type} with {units} units, "
         f"{len(data.bom_components)} parsed component entries, "
         f"{len(data.engineering_tables)} engineering tables, "
+        f"{len(data.thread_requirements)} thread requirements, "
         f"{len(data.dimensions)} dimension candidates, "
         f"{len(data.connections)} connection candidates"
         + (f", and component categories {category_summary}." if category_summary else ".")
