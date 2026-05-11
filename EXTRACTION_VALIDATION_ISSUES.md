@@ -18,7 +18,7 @@ Status meanings:
 | 3 | fixed | Text normalization | Repeated overprinted text is normalized in reconstructed lines. |
 | 4 | fixed | Text reconstruction | Spaced company text is recombined in reconstructed/normalized evidence. |
 | 5 | partial | Line reconstruction | Reconstructed lines help, but dense title/tolerance regions can still produce noisy evidence. |
-| 6 | partial | Tolerance symbols | Common tolerance artifacts are normalized and parsed; loose duplicate tolerance fragments/evidence noise still need cleanup. |
+| 6 | fixed | Tolerance symbols | Common tolerance artifacts are normalized; default tolerance rows are structured and loose duplicate fragments are suppressed. |
 | 7 | fixed | Title block parsing | MCP title fields now parse; cleanup tracked separately in Issue 14. |
 | 8 | fixed | Drawing type | MCP classifies as part manufacturing drawing. |
 | 9 | fixed | Standards | `ASME-Y14.5M` is parsed. |
@@ -26,15 +26,15 @@ Status meanings:
 | 11 | partial | Dimensions | Chamfer/diameter/inch dimensions improved; more advanced association still needed. |
 | 12 | partial | GD&T/tolerances | Tolerance rows and GD&T candidates are emitted; GD&T remains review-confidence. |
 | 13 | partial | Process/manufacturing | Heat treatment/finish no longer over-confirmed; manufacturing cleanup still needs refinement. |
-| 14 | open | Title block cleanup | Need page numbers, focused evidence, and generic/specific date precedence. |
+| 14 | fixed | Title block cleanup | Title fields now include page numbers/focused evidence; generic `date` is not created from `CREATED DATE`/`APPROVAL DATE`. |
 | 15 | open | Schema design | Need a generic engineering requirement model so each new PDF type does not require a new top-level section. |
 | 16 | open | Engineering tables | Need generic table classification for multiple table types across different PDFs. |
-| 17 | open | Thread parsing | Need richer thread fields such as threads-per-inch, chart label linkage, and cleaner evidence. |
-| 18 | open | Vision dimension merge | Need safer merging between deterministic dimensions and Bedrock vision dimensions. |
+| 17 | fixed | Thread parsing | Thread rows now include TPI, chart reference/source table, cleaner evidence, and `THREAD T` remains a chart reference. |
+| 18 | partial | Vision dimension merge | Bedrock now runs; clean dimensions stay separate from `review_dimensions`, preserving uncertain vision candidates for manual/document workflows. View segmentation is still needed. |
 | 19 | open | View segmentation | Need real drawing view/region segmentation for PDFs with multiple diagrams on one page. |
 | 20 | future | GD&T validation | Need multi-signal GD&T confirmation using text artifacts, vector frames, cropped vision/OCR, and symbol dictionaries. |
-| 21 | open | Surface finish symbols | Need symbol-aware extraction for surface finish values like `63 or better`. |
-| 22 | open | Notes classification | Need to split noisy note blocks into standard/legal/manufacturing/tolerance note types. |
+| 21 | fixed | Surface finish symbols | `SURFACE FINISH 63 OR BETTER` is captured as a manufacturing requirement with the `63` value. |
+| 22 | partial | Notes classification | Standard/legal notes are now typed; dense title/legal text can still contain OCR/reconstruction noise. |
 
 ## MCP02498.pdf
 
@@ -592,6 +592,7 @@ TOLERANCE:
 
 ### Issue 14: Structured title block fields need generic page/evidence/date cleanup
 
+- Status update: fixed in the cleanup pass. MCP title fields now carry page numbers and focused evidence such as `MODEL: LRM200`, `DWG No.: FM3845`, `CREATED DATE: 8/26/2014`; generic `date` is not emitted from `CREATED DATE` or `APPROVAL DATE`.
 - File checked: `outputs/MCP02498/structured_engineering_data.json`
 - This is a **general parser issue**, not an MCP02498-specific issue.
 - Observed structured title block output is mostly correct, but has cleanup problems:
@@ -721,6 +722,7 @@ Observed examples:
 
 ### Issue 17: Thread requirements need richer generic parsing fields and table linkage
 
+- Status update: fixed for the current schema. Unified thread rows now expose `threads_per_inch`, chart rows include `source_table: thread_chart`, and `THREAD 'T'` is retained as a review-confidence chart reference rather than a full standalone requirement.
 - File checked: `outputs/MCP02498/structured_engineering_data.json`
 - This is a **general thread parsing issue**, not an MCP02498-specific issue.
 - Current output captures thread requirements, including:
@@ -755,6 +757,7 @@ MCP02498 | -02 | #10-32 -2A
 
 ### Issue 18: Vision dimension merge can mix unrelated evidence into exact text dimensions
 
+- Status update: partially fixed. Bedrock runs with refreshed AWS credentials. High-confidence deterministic dimensions no longer absorb unrelated vision evidence directly. Clean/grounded dimensions remain in `dimensions`, while zero/reference values, thread-derived false positives, unknown-unit candidates, and ungrounded vision-only values are preserved in `review_dimensions` with warnings. Remaining risk is multi-view/region confusion until view segmentation is added.
 - File checked: `outputs/MCP02498/structured_engineering_data.json`
 - This is a **general vision/parser merge issue**, not an MCP02498-specific issue.
 - Observed behavior:
@@ -840,6 +843,7 @@ MCP02498 | -02 | #10-32 -2A
 
 ### Issue 21: Surface finish symbol/value extraction misses embedded visual value
 
+- Status update: fixed for the current text/reconstructed-text path. `SURFACE FINISH 63 OR BETTER` is now captured as `surface finish: 63 or better` under manufacturing requirements. Symbol/crop-based confirmation remains future hardening for PDFs where the value is not available as text.
 - File checked: `outputs/MCP02498/structured_engineering_data.json`
 - PDF area checked: standard notes surface finish line.
 - Observed PDF text visually contains:
@@ -881,6 +885,7 @@ finish requirement: SURFACE FINISH OR BETTER
 
 ### Issue 22: Notes output mixes legal, standard, manufacturing, and tolerance text
 
+- Status update: partially fixed. Notes are now typed into standard/legal note rows and structured tolerance/manufacturing rows are filtered out. Dense reconstructed legal/title text can still be noisy until stronger region segmentation is added.
 - File checked: `outputs/MCP02498/structured_engineering_data.json`
 - Current `notes` output includes broad/noisy note blocks such as:
 

@@ -47,6 +47,7 @@ def augment_dimensions_with_vision_llm(
                 image_bytes=image_bytes,
             )
             dimensions = _dimensions_from_response(response, page.page_number)
+            dimensions = _validated_vision_dimensions(dimensions, page.text, data)
             _merge_dimensions(data, dimensions)
         except Exception as exc:
             data.warnings.append(
@@ -66,6 +67,8 @@ def augment_dimensions_with_vision_llm(
             data.warnings.append(
                 f"Bedrock vision envelope extraction failed on page {page.page_number}: {exc}"
             )
+
+    data.drawing_structure["has_review_dimensions"] = bool(data.review_dimensions)
 
 
 def _render_pages_to_png(pdf_path: Path, page_numbers: list[int]) -> dict[int, bytes]:
@@ -502,15 +505,16 @@ def _normalize_numeric_text(text: str) -> str:
 def _number_visible_in_text(value: float, normalized_text: str) -> bool:
     candidates = {
         f"{value:g}",
-        f"{value:.1f}".rstrip("0").rstrip("."),
         f"{value:.2f}".rstrip("0").rstrip("."),
         f"{value:.3f}".rstrip("0").rstrip("."),
         f"{value:.3f}",
     }
+    if abs(value) >= 1:
+        candidates.add(f"{value:.1f}".rstrip("0").rstrip("."))
     for candidate in candidates:
         if not candidate:
             continue
-        pattern = rf"(?<![0-9.]){re.escape(candidate)}(?![0-9.])"
+        pattern = rf"(?<![A-Za-z0-9.#]){re.escape(candidate)}(?![A-Za-z0-9.])"
         if re.search(pattern, normalized_text):
             return True
     return False
@@ -673,14 +677,21 @@ def _merge_dimensions(data: StructuredEngineeringData, candidates: list[Dimensio
             data.dimensions.append(candidate)
             continue
 
-        existing.source = "mixed"
+        existing_source = existing.source
+        existing_confidence = existing.confidence
+        if existing.source != candidate.source:
+            existing.source = "mixed"
         existing.confidence = _higher_confidence(existing.confidence, candidate.confidence)  # type: ignore[assignment]
         if existing.role == "unknown" and candidate.role != "unknown":
             existing.role = candidate.role
             existing.role_confidence = candidate.role_confidence
         if existing.imperial_value is None and candidate.imperial_value is not None:
             existing.imperial_value = candidate.imperial_value
-        if candidate.evidence and candidate.evidence not in existing.evidence:
+        if existing_source == "text" and existing_confidence == "high" and candidate.source == "vision_llm":
+            warning = f"Vision also found a matching dimension candidate: {candidate.evidence}"
+            if warning not in existing.warnings:
+                existing.warnings.append(warning)
+        elif candidate.evidence and candidate.evidence not in existing.evidence:
             existing.evidence = (existing.evidence + " | Vision: " + candidate.evidence).strip(" |")
         for warning in candidate.warnings:
             if warning not in existing.warnings:
@@ -689,6 +700,8 @@ def _merge_dimensions(data: StructuredEngineeringData, candidates: list[Dimensio
 
 def _matching_dimension(existing_dimensions: list[DimensionCandidate], candidate: DimensionCandidate) -> DimensionCandidate | None:
     for existing in existing_dimensions:
+        if not _dimension_types_compatible(existing, candidate):
+            continue
         if existing.unit != candidate.unit:
             continue
         if abs(existing.value - candidate.value) > _dimension_tolerance(candidate):
@@ -700,11 +713,101 @@ def _matching_dimension(existing_dimensions: list[DimensionCandidate], candidate
     return None
 
 
+def _validated_vision_dimensions(
+    candidates: list[DimensionCandidate],
+    page_text: str,
+    data: StructuredEngineeringData,
+) -> list[DimensionCandidate]:
+    normalized_text = _normalize_numeric_text(page_text)
+    text_has_content = len(normalized_text) >= 50
+    validated: list[DimensionCandidate] = []
+    for candidate in candidates:
+        if _is_zero_reference_dimension(candidate):
+            _add_review_dimension(data, candidate, "Vision dimension looks like a zero/reference/start marker, not a usable dimension.")
+            continue
+        if _is_thread_derived_false_dimension(candidate, page_text):
+            _add_review_dimension(data, candidate, "Vision dimension appears to come from thread notation, not a standalone drawing dimension.")
+            continue
+
+        matched_existing = _matching_dimension(data.dimensions, candidate)
+        if matched_existing is None and candidate.unit == "unknown":
+            _add_review_dimension(data, candidate, "Vision-only dimension has unknown unit and does not match an existing deterministic dimension.")
+            continue
+        value_visible = _number_visible_in_text(candidate.value, normalized_text)
+        if text_has_content and matched_existing is None and not value_visible:
+            candidate.confidence = "review"
+            candidate.role_confidence = "review"
+            warning = "Vision-only dimension value was not found in native/reconstructed PDF text."
+            if warning not in candidate.warnings:
+                candidate.warnings.append(warning)
+            _add_review_dimension(data, candidate)
+            continue
+        validated.append(candidate)
+    return validated
+
+
+def _add_review_dimension(
+    data: StructuredEngineeringData,
+    candidate: DimensionCandidate,
+    warning: str = "",
+) -> None:
+    candidate.confidence = "review"
+    candidate.role_confidence = "review"
+    if warning and warning not in candidate.warnings:
+        candidate.warnings.append(warning)
+    key = _dimension_review_key(candidate)
+    if all(_dimension_review_key(existing) != key for existing in data.review_dimensions):
+        data.review_dimensions.append(candidate)
+
+
+def _dimension_review_key(candidate: DimensionCandidate) -> tuple[float, str, str, str]:
+    return (
+        round(candidate.value, 6),
+        candidate.unit,
+        candidate.dimension_type.casefold(),
+        candidate.evidence.casefold(),
+    )
+
+
+def _is_zero_reference_dimension(candidate: DimensionCandidate) -> bool:
+    if abs(candidate.value) > 1e-9:
+        return False
+    if candidate.source == "vision_llm" and candidate.dimension_type == "linear":
+        return True
+    text = f"{candidate.role} {candidate.evidence} {candidate.raw_callout}".casefold()
+    return any(token in text for token in ("start", "origin", "reference", "baseline", "datum"))
+
+
+def _is_thread_derived_false_dimension(candidate: DimensionCandidate, page_text: str) -> bool:
+    text = f"{candidate.role} {candidate.evidence} {candidate.raw_callout}".casefold()
+    if "thread" in text:
+        return True
+    if candidate.unit != "mm" or abs(candidate.value - round(candidate.value)) > 1e-9:
+        return False
+    major = int(round(candidate.value))
+    return bool(re.search(rf"\bM{major}(?:\s*x|x|-)?", page_text, re.I))
+
+
+def _dimension_types_compatible(existing: DimensionCandidate, candidate: DimensionCandidate) -> bool:
+    existing_type = (existing.dimension_type or "linear").casefold()
+    candidate_type = (candidate.dimension_type or "linear").casefold()
+    if existing_type == candidate_type:
+        return True
+    if "unknown" in {existing_type, candidate_type}:
+        return True
+    special_types = {"diameter", "radius", "chamfer", "angle"}
+    if existing_type in special_types or candidate_type in special_types:
+        return False
+    return existing_type == "linear" and candidate_type == "linear"
+
+
 def _dimension_tolerance(candidate: DimensionCandidate) -> float:
     if candidate.unit == "degree":
         return 0.2
     if abs(candidate.value) >= 100:
         return 0.5
+    if abs(candidate.value) < 1:
+        return 0.003
     return 0.15
 
 
@@ -763,5 +866,5 @@ def _combined_axis_confidence(envelope: OverallEnvelope) -> str:
 
 
 def _higher_confidence(left: str, right: str) -> str:
-    order = {"low": 0, "medium": 1, "high": 2}
+    order = {"low": 0, "review": 1, "medium": 2, "high": 3}
     return left if order.get(left, 0) >= order.get(right, 0) else right

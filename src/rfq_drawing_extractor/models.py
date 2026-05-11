@@ -188,11 +188,14 @@ class EngineeringTable(BaseModel):
 class ThreadRequirement(BaseModel):
     thread_size: str = ""
     pitch: float | None = None
+    threads_per_inch: int | None = None
     thread_class: str = ""
     quantity: int | None = None
     minimum_full_threads: int | None = None
     label: str = ""
     relief_note: str = ""
+    chart_reference: str = ""
+    source_table: str = ""
     source: SourceType = "text"
     page: int | None = None
     region_id: str = ""
@@ -260,6 +263,7 @@ class StructuredEngineeringData(BaseModel):
     engineering_tables: list[EngineeringTable] = Field(default_factory=list)
     thread_requirements: list[ThreadRequirement] = Field(default_factory=list)
     dimensions: list[DimensionCandidate] = Field(default_factory=list)
+    review_dimensions: list[DimensionCandidate] = Field(default_factory=list)
     connections: list[ConnectionCandidate] = Field(default_factory=list)
     notes: list[ExtractedField] = Field(default_factory=list)
     drawing_regions: list[DrawingRegion] = Field(default_factory=list)

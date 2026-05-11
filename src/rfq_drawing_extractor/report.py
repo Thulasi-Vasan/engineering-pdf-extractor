@@ -39,6 +39,7 @@ def build_markdown_report(result: ExtractionRunResult) -> str:
     lines.extend(_engineering_tables_section(data))
     lines.extend(_thread_requirements_section(data))
     lines.extend(_dimensions_section(data))
+    lines.extend(_review_dimensions_section(data))
     lines.extend(_overall_envelope_section(data))
     lines.extend(_connections_section(data))
     lines.extend(_field_section("Tolerances / GD&T Candidates", data.tolerances_gdnt))
@@ -121,16 +122,18 @@ def _thread_requirements_section(data: StructuredEngineeringData) -> list[str]:
         return lines + ["No thread requirements parsed.", ""]
     lines.extend(
         [
-            "| Thread Size | Pitch | Class | Min Full Threads | Label | Relief Note | Region | Confidence | Evidence |",
-            "|---|---:|---|---:|---|---|---|---|---|",
+            "| Thread Size | Pitch | TPI | Class | Min Full Threads | Label | Chart Ref | Source Table | Relief Note | Region | Confidence | Evidence |",
+            "|---|---:|---:|---|---:|---|---|---|---|---|---|---|",
         ]
     )
     for item in data.thread_requirements[:80]:
         pitch = "" if item.pitch is None else str(item.pitch)
+        tpi = "" if item.threads_per_inch is None else str(item.threads_per_inch)
         min_threads = "" if item.minimum_full_threads is None else str(item.minimum_full_threads)
         lines.append(
-            f"| {item.thread_size} | {pitch} | {item.thread_class} | {min_threads} | "
-            f"{_escape(item.label)} | {_escape(item.relief_note)} | {item.region_id} | "
+            f"| {item.thread_size} | {pitch} | {tpi} | {item.thread_class} | {min_threads} | "
+            f"{_escape(item.label)} | {_escape(item.chart_reference)} | {_escape(item.source_table)} | "
+            f"{_escape(item.relief_note)} | {item.region_id} | "
             f"{item.confidence} | {_escape(item.evidence)} |"
         )
     lines.append("")
@@ -157,6 +160,27 @@ def _dimensions_section(data: StructuredEngineeringData) -> list[str]:
             f"| {item.value} | {item.unit} | {secondary} | {imperial} | {item.dimension_type} | "
             f"{quantity} | {angle} | {item.role} | {item.region_id} | {item.source} | "
             f"{item.confidence} | {_escape(evidence)} |"
+        )
+    lines.append("")
+    return lines
+
+
+def _review_dimensions_section(data: StructuredEngineeringData) -> list[str]:
+    lines = ["### Review Dimension Candidates", ""]
+    if not data.review_dimensions:
+        return lines + ["No review-only dimension candidates.", ""]
+    lines.extend(
+        [
+            "| Value | Unit | Type | Role | Source | Confidence | Evidence | Warnings |",
+            "|---:|---|---|---|---|---|---|---|",
+        ]
+    )
+    for item in data.review_dimensions[:100]:
+        warnings = "<br>".join(_escape(warning) for warning in item.warnings)
+        evidence = item.raw_callout or item.evidence
+        lines.append(
+            f"| {item.value} | {item.unit} | {item.dimension_type} | {item.role} | "
+            f"{item.source} | {item.confidence} | {_escape(evidence)} | {warnings} |"
         )
     lines.append("")
     return lines
