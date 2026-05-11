@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from .models import ExtractionRunResult, StructuredEngineeringData
 
 
@@ -37,6 +39,7 @@ def build_markdown_report(result: ExtractionRunResult) -> str:
     lines.extend(_field_section("Units", [data.units] if data.units else []))
     lines.extend(_components_section(data))
     lines.extend(_engineering_tables_section(data))
+    lines.extend(_engineering_requirements_section(data))
     lines.extend(_thread_requirements_section(data))
     lines.extend(_dimensions_section(data))
     lines.extend(_review_dimensions_section(data))
@@ -103,7 +106,15 @@ def _engineering_tables_section(data: StructuredEngineeringData) -> list[str]:
     if not data.engineering_tables:
         return lines + ["No non-BOM engineering tables parsed.", ""]
     for table in data.engineering_tables[:20]:
-        lines.extend([f"#### {table.table_type}", ""])
+        table_title = table.table_id or table.table_type
+        lines.extend([f"#### {table_title}", ""])
+        lines.append(
+            f"- Type: `{table.table_type}` | Page: {table.page or ''} | "
+            f"Index: {table.table_index if table.table_index is not None else ''} | Confidence: `{table.confidence}`"
+        )
+        if table.warnings:
+            lines.extend(f"- Warning: {warning}" for warning in table.warnings)
+        lines.append("")
         if not table.rows:
             lines.extend(["No rows parsed.", ""])
             continue
@@ -113,6 +124,27 @@ def _engineering_tables_section(data: StructuredEngineeringData) -> list[str]:
         for row in table.rows[:80]:
             lines.append("| " + " | ".join(_escape(row.get(header, "")) for header in headers) + " |")
         lines.append("")
+    return lines
+
+
+def _engineering_requirements_section(data: StructuredEngineeringData) -> list[str]:
+    lines = ["### Engineering Requirements", ""]
+    if not data.engineering_requirements:
+        return lines + ["No generic engineering requirements parsed.", ""]
+    lines.extend(
+        [
+            "| Type | Value | Page | Region | Confidence | Parsed Fields | Evidence | Warnings |",
+            "|---|---|---:|---|---|---|---|---|",
+        ]
+    )
+    for item in data.engineering_requirements[:120]:
+        parsed_fields = _escape(json.dumps(item.parsed_fields, ensure_ascii=False, sort_keys=True))
+        warnings = "<br>".join(_escape(warning) for warning in item.warnings)
+        lines.append(
+            f"| {item.requirement_type} | {_escape(item.value)} | {item.page or ''} | "
+            f"{item.region_id} | {item.confidence} | {parsed_fields} | {_escape(item.evidence)} | {warnings} |"
+        )
+    lines.append("")
     return lines
 
 

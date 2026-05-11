@@ -176,10 +176,24 @@ class ConnectionCandidate(BaseModel):
 
 class EngineeringTable(BaseModel):
     table_type: str
+    table_id: str = ""
+    table_index: int | None = None
     headers: list[str] = Field(default_factory=list)
     rows: list[dict[str, str]] = Field(default_factory=list)
     source: SourceType = "text"
     page: int | None = None
+    confidence: ConfidenceLabel = "medium"
+    evidence: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
+class EngineeringRequirement(BaseModel):
+    requirement_type: str
+    value: str
+    parsed_fields: dict[str, Any] = Field(default_factory=dict)
+    source: SourceType = "text"
+    page: int | None = None
+    region_id: str = ""
     confidence: ConfidenceLabel = "medium"
     evidence: str = ""
     warnings: list[str] = Field(default_factory=list)
@@ -261,6 +275,7 @@ class StructuredEngineeringData(BaseModel):
     standards: list[ExtractedField] = Field(default_factory=list)
     bom_components: list[BomComponent] = Field(default_factory=list)
     engineering_tables: list[EngineeringTable] = Field(default_factory=list)
+    engineering_requirements: list[EngineeringRequirement] = Field(default_factory=list)
     thread_requirements: list[ThreadRequirement] = Field(default_factory=list)
     dimensions: list[DimensionCandidate] = Field(default_factory=list)
     review_dimensions: list[DimensionCandidate] = Field(default_factory=list)

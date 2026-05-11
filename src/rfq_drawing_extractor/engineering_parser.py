@@ -8,6 +8,7 @@ from .models import (
     ConnectionCandidate,
     DimensionCandidate,
     DrawingRegion,
+    EngineeringRequirement,
     EngineeringTable,
     ExtractedField,
     RawExtractionResult,
@@ -76,6 +77,7 @@ def parse_engineering_data(raw: RawExtractionResult) -> StructuredEngineeringDat
     data.tolerances_gdnt = _parse_tolerances_gdnt(raw)
     data.process_requirements = _parse_process_signals(raw)
     data.manufacturing_requirements = _parse_manufacturing_requirements(raw, data.title_block)
+    data.engineering_requirements = _build_engineering_requirements(data)
     data.notes = _parse_notes(raw)
     data.drawing_structure = _parse_drawing_structure(raw, data)
     data.semantic_summary = _build_semantic_summary(data)
@@ -447,32 +449,103 @@ def _components_from_text(raw: RawExtractionResult) -> list[BomComponent]:
 def _parse_engineering_tables(raw: RawExtractionResult) -> list[EngineeringTable]:
     tables: list[EngineeringTable] = []
     for page in raw.pages:
-        for table in page.tables:
-            if not table.rows:
+        for table_index, table in enumerate(page.tables, start=1):
+            if not table.rows or not any(any(cell.strip() for cell in row) for row in table.rows):
                 continue
             headers = [cell.strip() for cell in table.rows[0]]
             normalized_headers = [_normalize_header(header) for header in headers]
-            if _is_thread_or_item_chart(normalized_headers):
-                rows = []
-                for raw_row in table.rows[1:]:
-                    row = {}
-                    for header, value in zip(normalized_headers, raw_row, strict=False):
-                        if header:
-                            row[header] = value.strip()
-                    if any(row.values()):
-                        rows.append(row)
-                if rows:
-                    tables.append(
-                        EngineeringTable(
-                            table_type="thread_or_item_chart",
-                            headers=normalized_headers,
-                            rows=rows,
-                            page=page.page_number,
-                            confidence="high",
-                            evidence=" | ".join(headers),
-                        )
+            table_type, confidence, warnings = _classify_engineering_table(normalized_headers, table.rows)
+            if table_type in {"bom_component_table", "layout_or_title_block_table"}:
+                continue
+            rows = _normalized_table_rows(normalized_headers, table.rows[1:])
+            if rows or table_type != "unknown_engineering_table":
+                tables.append(
+                    EngineeringTable(
+                        table_type=table_type,
+                        table_id=f"page_{page.page_number}_table_{table_index}",
+                        table_index=table_index,
+                        headers=normalized_headers,
+                        rows=rows,
+                        page=page.page_number,
+                        confidence=confidence,
+                        evidence=" | ".join(header for header in headers if header),
+                        warnings=warnings,
                     )
+                )
     return tables
+
+
+def _normalized_table_rows(headers: list[str], raw_rows: list[list[str]]) -> list[dict[str, str]]:
+    rows = []
+    fallback_headers = headers or []
+    for raw_row in raw_rows:
+        row = {}
+        for index, value in enumerate(raw_row):
+            header = fallback_headers[index] if index < len(fallback_headers) and fallback_headers[index] else f"column_{index + 1}"
+            row[header] = value.strip()
+        if any(row.values()):
+            rows.append(row)
+    return rows
+
+
+def _classify_engineering_table(headers: list[str], rows: list[list[str]]) -> tuple[str, str, list[str]]:
+    header_set = set(headers)
+    text = " ".join(" ".join(row) for row in rows).casefold()
+    warnings: list[str] = []
+    if _looks_like_layout_or_title_block_table(headers, text):
+        return "layout_or_title_block_table", "low", ["Native table looks like a layout/title-block extraction, not a reusable engineering table."]
+    if {"item_number", "chart_number", "thread_size"}.issubset(header_set) or "thread_size" in header_set:
+        return "thread_chart", "high", warnings
+    if {"item_number", "component_name"}.issubset(header_set) or {"no.", "name"}.issubset(header_set):
+        return "bom_component_table", "high", warnings
+    if any(token in header_set for token in ("hole_size", "hole_diameter", "drill_size")) or "drill" in text:
+        return "hole_chart", "medium", warnings
+    if any(token in header_set for token in ("bolt_size", "bolt", "fastener")) or "bolt" in text:
+        return "bolt_chart", "medium", warnings
+    if any(token in header_set for token in ("finish", "surface_finish", "coating", "plating")) or any(token in text for token in ("finish", "coating", "plating")):
+        return "finish_chart", "medium", warnings
+    if any(token in header_set for token in ("material", "material_spec", "specification")) or "material" in text:
+        return "material_table", "medium", warnings
+    if any(token in header_set for token in ("tolerance", "tol")) or "tolerance" in text:
+        return "tolerance_table", "medium", warnings
+    if any(token in header_set for token in ("revision", "rev", "description", "date")) and "revision" in text:
+        return "revision_table", "medium", warnings
+    if any(token in header_set for token in ("inspection", "characteristic")) or "inspection" in text:
+        return "inspection_table", "medium", warnings
+    if "torque" in header_set or "torque" in text:
+        return "torque_table", "medium", warnings
+    if _table_has_engineering_signal(text):
+        warnings.append("Table has engineering-like content but did not match a known table type.")
+        return "unknown_engineering_table", "review", warnings
+    return "unknown_engineering_table", "review", ["Table did not match a known engineering table type."]
+
+
+def _looks_like_layout_or_title_block_table(headers: list[str], text: str) -> bool:
+    has_giant_header = any(len(header) > 80 for header in headers)
+    title_tokens = ("model:", "dwg no.", "drawn by:", "approved by:", "standard notes", "revisions:")
+    title_token_count = sum(1 for token in title_tokens if token in text)
+    known_header_count = sum(1 for header in headers if header in {"item_number", "chart_number", "thread_size", "material", "finish", "tolerance"})
+    return has_giant_header and title_token_count >= 2 and known_header_count == 0
+
+
+def _table_has_engineering_signal(text: str) -> bool:
+    signals = (
+        "thread",
+        "material",
+        "finish",
+        "coating",
+        "plating",
+        "tolerance",
+        "inspection",
+        "torque",
+        "hole",
+        "drill",
+        "bolt",
+        "revision",
+        "rev",
+        "heat treat",
+    )
+    return any(signal in text for signal in signals)
 
 
 def _normalize_header(header: str) -> str:
@@ -485,6 +558,26 @@ def _normalize_header(header: str) -> str:
         "chart #": "chart_number",
         "thread size 't'": "thread_size",
         "thread size": "thread_size",
+        "item": "item_number",
+        "no.": "no.",
+        "no": "no.",
+        "name": "name",
+        "component": "component_name",
+        "component name": "component_name",
+        "description": "description",
+        "rev": "rev",
+        "revision": "revision",
+        "date": "date",
+        "material": "material",
+        "finish": "finish",
+        "surface finish": "surface_finish",
+        "tolerance": "tolerance",
+        "hole size": "hole_size",
+        "hole diameter": "hole_diameter",
+        "drill size": "drill_size",
+        "bolt size": "bolt_size",
+        "torque": "torque",
+        "inspection": "inspection",
     }
     return aliases.get(normalized, normalized.replace(" ", "_"))
 
@@ -630,6 +723,145 @@ def _parse_thread_requirements(
                 requirements.append(requirement)
 
     return requirements
+
+
+def _build_engineering_requirements(data: StructuredEngineeringData) -> list[EngineeringRequirement]:
+    requirements: list[EngineeringRequirement] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for thread in data.thread_requirements:
+        parsed_fields = {
+            "thread_size": thread.thread_size,
+            "pitch": thread.pitch,
+            "threads_per_inch": thread.threads_per_inch,
+            "thread_class": thread.thread_class,
+            "minimum_full_threads": thread.minimum_full_threads,
+            "chart_reference": thread.chart_reference,
+            "source_table": thread.source_table,
+            "label": thread.label,
+            "relief_note": thread.relief_note,
+        }
+        value = thread.evidence or thread.thread_size or thread.label
+        requirement = EngineeringRequirement(
+            requirement_type="thread",
+            value=value,
+            parsed_fields={key: value for key, value in parsed_fields.items() if value not in (None, "")},
+            source=thread.source,
+            page=thread.page,
+            region_id=thread.region_id,
+            confidence=thread.confidence,
+            evidence=thread.evidence,
+            warnings=thread.warnings,
+        )
+        _append_requirement(requirements, seen, requirement)
+
+    for field in data.manufacturing_requirements:
+        requirement_type = _requirement_type_from_value(field.value)
+        requirement = EngineeringRequirement(
+            requirement_type=requirement_type,
+            value=field.value,
+            parsed_fields=_parsed_fields_from_requirement_value(requirement_type, field.value),
+            source=field.source,
+            page=field.page,
+            confidence=field.confidence,
+            evidence=field.evidence,
+            warnings=field.warnings,
+        )
+        _append_requirement(requirements, seen, requirement)
+
+    for field in data.process_requirements:
+        requirement = EngineeringRequirement(
+            requirement_type="process",
+            value=field.value,
+            parsed_fields={"process": field.value},
+            source=field.source,
+            page=field.page,
+            confidence=field.confidence,
+            evidence=field.evidence,
+            warnings=field.warnings,
+        )
+        _append_requirement(requirements, seen, requirement)
+
+    for connection in data.connections:
+        value = " ".join(part for part in (connection.label, connection.size, connection.connection_type) if part).strip()
+        if not value:
+            continue
+        requirement = EngineeringRequirement(
+            requirement_type="connection",
+            value=value,
+            parsed_fields={
+                "label": connection.label,
+                "size": connection.size,
+                "connection_type": connection.connection_type,
+                "option": connection.option,
+            },
+            source=connection.source,
+            page=connection.page,
+            confidence=connection.confidence,
+            evidence=connection.evidence,
+            warnings=connection.warnings,
+        )
+        _append_requirement(requirements, seen, requirement)
+
+    return requirements
+
+
+def _append_requirement(
+    requirements: list[EngineeringRequirement],
+    seen: set[tuple[str, str, str]],
+    requirement: EngineeringRequirement,
+) -> None:
+    key = (requirement.requirement_type, requirement.value.casefold(), requirement.evidence.casefold())
+    if key in seen:
+        return
+    seen.add(key)
+    requirements.append(requirement)
+
+
+def _requirement_type_from_value(value: str) -> str:
+    lowered = value.casefold()
+    if lowered.startswith("material:"):
+        return "material"
+    if lowered.startswith("surface finish:"):
+        return "surface_finish"
+    if lowered.startswith("heat treatment"):
+        return "heat_treatment"
+    if lowered.startswith("finish"):
+        return "finish"
+    if "burr" in lowered or "sharp edge" in lowered or "edge break" in lowered:
+        return "edge_break"
+    if "plating" in lowered or "coating" in lowered:
+        return "coating"
+    if "machin" in lowered:
+        return "machining"
+    if "cast" in lowered:
+        return "casting"
+    if "weld" in lowered:
+        return "welding"
+    if "inspection" in lowered:
+        return "inspection"
+    return "manufacturing"
+
+
+def _parsed_fields_from_requirement_value(requirement_type: str, value: str) -> dict[str, object]:
+    if ":" not in value:
+        return {"text": value}
+    label, raw_value = value.split(":", 1)
+    parsed: dict[str, object] = {"label": label.strip(), "value": raw_value.strip()}
+    if requirement_type == "surface_finish":
+        match = re.search(r"(\d+(?:\.\d+)?)", raw_value)
+        if match:
+            parsed["surface_finish_value"] = float(match.group(1))
+    if requirement_type == "edge_break":
+        range_match = RANGE_RE.search(raw_value)
+        if range_match:
+            parsed["range_start"] = _float_from_maybe_leading_decimal(range_match.group("start"))
+            parsed["range_end"] = _float_from_maybe_leading_decimal(range_match.group("end"))
+    return parsed
+
+
+def _float_from_maybe_leading_decimal(value: str) -> float:
+    return float(f"0{value}" if value.startswith(".") else value)
 
 
 def _thread_requirement_key(requirement: ThreadRequirement) -> str:
@@ -1377,6 +1609,7 @@ def _parse_drawing_structure(raw: RawExtractionResult, data: StructuredEngineeri
         "has_title_block": bool(data.title_block),
         "has_bom_table": bool(data.bom_components),
         "has_engineering_tables": bool(data.engineering_tables),
+        "has_engineering_requirements": bool(data.engineering_requirements),
         "has_thread_requirements": bool(data.thread_requirements),
         "has_review_dimensions": bool(data.review_dimensions),
         "has_callout_balloons": _callout_count(text) >= 3,
@@ -1406,6 +1639,7 @@ def _build_semantic_summary(data: StructuredEngineeringData) -> str:
         f"{manufacturer} {model} {drawing_type} with {units} units, "
         f"{len(data.bom_components)} parsed component entries, "
         f"{len(data.engineering_tables)} engineering tables, "
+        f"{len(data.engineering_requirements)} engineering requirements, "
         f"{len(data.thread_requirements)} thread requirements, "
         f"{len(data.dimensions)} dimension candidates, "
         f"{len(data.review_dimensions)} review dimension candidates, "

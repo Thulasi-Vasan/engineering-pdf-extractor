@@ -27,8 +27,8 @@ Status meanings:
 | 12 | partial | GD&T/tolerances | Tolerance rows and GD&T candidates are emitted; GD&T remains review-confidence. |
 | 13 | partial | Process/manufacturing | Heat treatment/finish no longer over-confirmed; manufacturing cleanup still needs refinement. |
 | 14 | fixed | Title block cleanup | Title fields now include page numbers/focused evidence; generic `date` is not created from `CREATED DATE`/`APPROVAL DATE`. |
-| 15 | open | Schema design | Need a generic engineering requirement model so each new PDF type does not require a new top-level section. |
-| 16 | open | Engineering tables | Need generic table classification for multiple table types across different PDFs. |
+| 15 | fixed | Schema design | Generic `engineering_requirements` now projects thread, manufacturing, process, and connection data into one downstream-friendly layer. |
+| 16 | partial | Engineering tables | Tables now have IDs/indexes and broader classification; coordinates and deeper table-specific parsers remain future work. |
 | 17 | fixed | Thread parsing | Thread rows now include TPI, chart reference/source table, cleaner evidence, and `THREAD T` remains a chart reference. |
 | 18 | partial | Vision dimension merge | Bedrock now runs; clean dimensions stay separate from `review_dimensions`, preserving uncertain vision candidates for manual/document workflows. View segmentation is still needed. |
 | 19 | open | View segmentation | Need real drawing view/region segmentation for PDFs with multiple diagrams on one page. |
@@ -632,6 +632,7 @@ Observed examples:
 
 ### Issue 15: Need generic engineering requirement schema for non-thread PDF requirements
 
+- Status update: fixed for the current schema. `engineering_requirements` now provides a generic downstream layer while preserving specialized sections like `thread_requirements`, `manufacturing_requirements`, and `connections`.
 - File checked: `outputs/MCP02498/structured_engineering_data.json`
 - This is a **general schema design issue**, not an MCP02498-specific issue.
 - Current improvement added `thread_requirements`, which is useful for MCP02498 because that drawing has thread callouts and a thread chart.
@@ -683,6 +684,7 @@ Observed examples:
 
 ### Issue 16: Need generic engineering table classification for different PDF table types
 
+- Status update: partially fixed. `engineering_tables` now includes stable `table_id`, `table_index`, broader table type classification, and review-confidence unknown engineering tables. Table coordinates and deeper table-specific row parsers are still future work.
 - File checked: `outputs/MCP02498/structured_engineering_data.json`
 - This is a **general table parsing issue**, not an MCP02498-specific issue.
 - Current output correctly stores the MCP table as:
