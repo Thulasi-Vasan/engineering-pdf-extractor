@@ -672,11 +672,15 @@ def _envelope_score(envelope: OverallEnvelope) -> int:
 
 def _merge_dimensions(data: StructuredEngineeringData, candidates: list[DimensionCandidate]) -> None:
     for candidate in candidates:
+        if not candidate.region_id:
+            candidate.region_id = _default_region_id_for_page(data, candidate.page)
         existing = _matching_dimension(data.dimensions, candidate)
         if existing is None:
             data.dimensions.append(candidate)
             continue
 
+        if not existing.region_id:
+            existing.region_id = candidate.region_id or _default_region_id_for_page(data, existing.page)
         existing_source = existing.source
         existing_confidence = existing.confidence
         if existing.source != candidate.source:
@@ -753,11 +757,22 @@ def _add_review_dimension(
 ) -> None:
     candidate.confidence = "review"
     candidate.role_confidence = "review"
+    if not candidate.region_id:
+        candidate.region_id = _default_region_id_for_page(data, candidate.page)
     if warning and warning not in candidate.warnings:
         candidate.warnings.append(warning)
     key = _dimension_review_key(candidate)
     if all(_dimension_review_key(existing) != key for existing in data.review_dimensions):
         data.review_dimensions.append(candidate)
+
+
+def _default_region_id_for_page(data: StructuredEngineeringData, page_number: int | None) -> str:
+    if page_number is None:
+        return ""
+    for region in data.drawing_regions:
+        if region.page == page_number and region.region_type == "drawing_body":
+            return region.region_id
+    return ""
 
 
 def _dimension_review_key(candidate: DimensionCandidate) -> tuple[float, str, str, str]:

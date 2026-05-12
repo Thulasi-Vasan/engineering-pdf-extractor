@@ -30,8 +30,8 @@ Status meanings:
 | 15 | fixed | Schema design | Generic `engineering_requirements` now projects thread, manufacturing, process, and connection data into one downstream-friendly layer. |
 | 16 | partial | Engineering tables | Tables now have IDs/indexes and broader classification; coordinates and deeper table-specific parsers remain future work. |
 | 17 | fixed | Thread parsing | Thread rows now include TPI, chart reference/source table, cleaner evidence, and `THREAD T` remains a chart reference. |
-| 18 | partial | Vision dimension merge | Bedrock now runs; clean dimensions stay separate from `review_dimensions`, preserving uncertain vision candidates for manual/document workflows. View segmentation is still needed. |
-| 19 | open | View segmentation | Need real drawing view/region segmentation for PDFs with multiple diagrams on one page. |
+| 18 | partial | Vision dimension merge | Bedrock now runs; clean dimensions stay separate from `review_dimensions`, preserving uncertain vision candidates for manual/document workflows. Vision-only candidates now default to drawing-body regions; full view segmentation is still needed. |
+| 19 | partial | View segmentation | PyMuPDF vector primitives now create drawing-view candidate regions, including multiple RC2 view regions. Full semantic view/leader-line association is still open. |
 | 20 | future | GD&T validation | Need multi-signal GD&T confirmation using text artifacts, vector frames, cropped vision/OCR, and symbol dictionaries. |
 | 21 | fixed | Surface finish symbols | `SURFACE FINISH 63 OR BETTER` is captured as a manufacturing requirement with the `63` value. |
 | 22 | partial | Notes classification | Standard/legal notes are now typed; dense title/legal text can still contain OCR/reconstruction noise. |
@@ -788,6 +788,7 @@ MCP02498 | -02 | #10-32 -2A
 
 ### Issue 19: Multiple drawing views/diagrams on one page need real view segmentation
 
+- Status update: partially fixed in the generic region-assignment cleanup and vector extraction pass. The parser now creates per-table engineering regions, extracts PyMuPDF vector primitives, and creates drawing-view candidate regions from dense vector clusters. This is still not full semantic multi-view segmentation or CAD geometry understanding.
 - Current output has basic `drawing_regions`, such as:
   - `page_1_drawing_body`
   - `page_1_title_block`
@@ -812,6 +813,12 @@ MCP02498 | -02 | #10-32 -2A
   - Detect separate view/diagram regions on each page.
   - Assign dimensions, callouts, GD&T, notes, and leader-line text to a region before structured parsing.
   - Keep title blocks, tables, and notes separate from drawing body regions.
+- Current vector pass behavior:
+  - Raw extraction now includes `drawing_primitives` from PyMuPDF `page.get_drawings()`.
+  - RC2 now exposes multiple `drawing_view` candidate regions from vector clusters.
+  - MCP red annotation/leader geometry is captured as vector primitive candidates.
+- Remaining limitation:
+  - The pipeline can extract colored/vector line primitives and group likely drawing views, but it does not yet fully understand the drawing geometry or associate every dimension/leader/GD&T frame to the correct feature.
 - Future fix ideas:
   - Add `Flow 3.5: Drawing Region / View Segmentation`.
   - Use coordinate clustering, PyMuPDF vector paths, view labels like `DETAIL A` / `SECTION A-A`, and optional Bedrock vision review.

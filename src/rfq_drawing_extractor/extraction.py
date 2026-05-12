@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
-from .models import PageDetectionResult, PageExtraction, RawExtractionResult, TableExtraction, TextLine, WordBox
+from .models import DrawingPrimitive, PageDetectionResult, PageExtraction, RawExtractionResult, TableExtraction, TextLine, WordBox
 from .normalization import normalize_reconstructed_text, normalize_text
 from .textract_ocr import analyze_page_with_textract
 
@@ -15,6 +16,9 @@ def extract_raw_content(pdf_path: Path, detection: PageDetectionResult) -> RawEx
 
     pages: list[PageExtraction] = []
     document_warnings = list(detection.document_warnings)
+
+    vector_pages, vector_warnings = _extract_vector_primitives(pdf_path)
+    document_warnings.extend(vector_warnings)
 
     with pdfplumber.open(str(pdf_path)) as pdf:
         for page_detection, page in zip(detection.pages, pdf.pages, strict=False):
@@ -56,6 +60,7 @@ def extract_raw_content(pdf_path: Path, detection: PageDetectionResult) -> RawEx
                     page_height=float(page.height),
                     words=words,
                     reconstructed_lines=reconstructed_lines,
+                    drawing_primitives=vector_pages.get(page_detection.page_number, []),
                     tables=tables,
                     textract_lines=textract_lines,
                     warnings=warnings,
@@ -68,6 +73,169 @@ def extract_raw_content(pdf_path: Path, detection: PageDetectionResult) -> RawEx
         pages=pages,
         document_warnings=document_warnings,
     )
+
+
+def _extract_vector_primitives(pdf_path: Path) -> tuple[dict[int, list[DrawingPrimitive]], list[str]]:
+    try:
+        import fitz
+    except ImportError:
+        return {}, ["pymupdf is not installed; vector drawing primitives were not extracted."]
+
+    pages: dict[int, list[DrawingPrimitive]] = {}
+    warnings: list[str] = []
+    try:
+        document = fitz.open(str(pdf_path))
+    except Exception as exc:
+        return {}, [f"Vector drawing primitive extraction failed: {exc}"]
+
+    try:
+        for page_index in range(document.page_count):
+            page = document.load_page(page_index)
+            page_number = page_index + 1
+            primitives: list[DrawingPrimitive] = []
+            try:
+                drawings = page.get_drawings()
+            except Exception as exc:
+                warnings.append(f"Page {page_number}: PyMuPDF vector extraction failed: {exc}")
+                pages[page_number] = primitives
+                continue
+            for drawing in drawings:
+                primitive = _drawing_primitive_from_pymupdf(page, page_number, drawing)
+                if primitive is not None:
+                    primitives.append(primitive)
+            pages[page_number] = primitives
+    finally:
+        document.close()
+    return pages, warnings
+
+
+def _drawing_primitive_from_pymupdf(page: Any, page_number: int, drawing: dict[str, Any]) -> DrawingPrimitive | None:
+    rect = drawing.get("rect")
+    if rect is None or rect.is_empty or rect.is_infinite:
+        return None
+    if getattr(page, "rotation", 0):
+        rect = rect * page.rotation_matrix
+    x0 = max(0.0, float(min(rect.x0, rect.x1)))
+    top = max(0.0, float(min(rect.y0, rect.y1)))
+    x1 = min(float(page.rect.width), float(max(rect.x0, rect.x1)))
+    bottom = min(float(page.rect.height), float(max(rect.y0, rect.y1)))
+    if x1 < x0 or bottom < top:
+        return None
+    width = x1 - x0
+    height = bottom - top
+    if width < 0.05 and height < 0.05:
+        return None
+
+    path_type = str(drawing.get("type") or "")
+    items = drawing.get("items") or []
+    line_width = _float_or_none(drawing.get("width"))
+    stroke_color = _color_to_hex(drawing.get("color"))
+    fill_color = _color_to_hex(drawing.get("fill"))
+    primitive_type, confidence, primitive_warnings = _classify_drawing_primitive(
+        width=width,
+        height=height,
+        stroke_color=stroke_color,
+        fill_color=fill_color,
+        line_width=line_width,
+        path_type=path_type,
+        item_count=len(items),
+        items=items,
+    )
+    return DrawingPrimitive(
+        page=page_number,
+        primitive_type=primitive_type,
+        path_type=path_type,
+        x0=round(x0, 3),
+        top=round(top, 3),
+        x1=round(x1, 3),
+        bottom=round(bottom, 3),
+        stroke_color=stroke_color,
+        fill_color=fill_color,
+        line_width=line_width,
+        item_count=len(items),
+        confidence=confidence,
+        warnings=primitive_warnings,
+    )
+
+
+def _classify_drawing_primitive(
+    *,
+    width: float,
+    height: float,
+    stroke_color: str,
+    fill_color: str,
+    line_width: float | None,
+    path_type: str,
+    item_count: int,
+    items: list[object],
+) -> tuple[str, str, list[str]]:
+    warnings: list[str] = []
+    max_side = max(width, height)
+    min_side = min(width, height)
+    thin = min_side <= max(1.2, (line_width or 0.5) * 2.5)
+    closed_like = item_count >= 4 or any(_path_item_type(item) == "re" for item in items)
+    red = _is_red(stroke_color)
+    green_or_blue = _is_green_or_blue(stroke_color)
+
+    if closed_like and 8 <= width <= 90 and 4 <= height <= 28:
+        return "gdnt_frame_candidate", "review", ["Small enclosed vector frame; GD&T meaning requires text/vision confirmation."]
+    if closed_like and width >= 40 and height >= 20 and (width / max(height, 0.1) > 4 or height / max(width, 0.1) > 4):
+        return "table_box", "medium", warnings
+    if red and max_side >= 4:
+        return "leader_line", "medium", warnings
+    if green_or_blue and thin and max_side >= 10:
+        return "centerline", "medium", warnings
+    if thin and max_side >= 20:
+        return "dimension_line_candidate", "review", ["Thin vector line may be geometry, dimension, or extension line."]
+    if closed_like and width >= 20 and height >= 20:
+        return "frame_box", "medium", warnings
+    if max_side >= 4:
+        return "drawing_line", "medium" if stroke_color else "low", warnings
+    return "unknown_vector", "low", warnings
+
+
+def _path_item_type(item: object) -> str:
+    if isinstance(item, (tuple, list)) and item:
+        return str(item[0])
+    return ""
+
+
+def _color_to_hex(value: object) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, (tuple, list)) or len(value) < 3:
+        return ""
+    try:
+        red, green, blue = (max(0, min(255, round(float(channel) * 255))) for channel in value[:3])
+    except (TypeError, ValueError):
+        return ""
+    return f"#{red:02x}{green:02x}{blue:02x}"
+
+
+def _is_red(color: str) -> bool:
+    rgb = _hex_to_rgb(color)
+    return bool(rgb and rgb[0] >= 160 and rgb[1] <= 90 and rgb[2] <= 90)
+
+
+def _is_green_or_blue(color: str) -> bool:
+    rgb = _hex_to_rgb(color)
+    return bool(rgb and ((rgb[1] >= 130 and rgb[0] <= 120) or (rgb[2] >= 130 and rgb[0] <= 120)))
+
+
+def _hex_to_rgb(color: str) -> tuple[int, int, int] | None:
+    if not color.startswith("#") or len(color) != 7:
+        return None
+    try:
+        return int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+    except ValueError:
+        return None
+
+
+def _float_or_none(value: object) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _extract_words(page: object) -> list[WordBox]:

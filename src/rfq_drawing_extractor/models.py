@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 PageType = Literal["text_page", "image_page", "hybrid_page", "empty_or_unknown_page"]
 PdfType = Literal["text_vector_pdf", "scanned_image_pdf", "hybrid_pdf", "unreadable_pdf"]
 ExtractionMethod = Literal["text", "ocr", "mixed", "none"]
-SourceType = Literal["text", "ocr", "mixed", "inferred", "vision_llm"]
+SourceType = Literal["text", "ocr", "mixed", "inferred", "vision_llm", "vector"]
 ConfidenceLabel = Literal["high", "medium", "low", "review"]
 
 
@@ -96,6 +96,23 @@ class TextLine(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class DrawingPrimitive(BaseModel):
+    page: int
+    primitive_type: str = "unknown_vector"
+    path_type: str = ""
+    x0: float
+    top: float
+    x1: float
+    bottom: float
+    stroke_color: str = ""
+    fill_color: str = ""
+    line_width: float | None = None
+    item_count: int = 0
+    source: SourceType = "vector"
+    confidence: ConfidenceLabel = "low"
+    warnings: list[str] = Field(default_factory=list)
+
+
 class PageExtraction(BaseModel):
     page_number: int
     page_type: PageType
@@ -106,6 +123,7 @@ class PageExtraction(BaseModel):
     page_height: float
     words: list[WordBox] = Field(default_factory=list)
     reconstructed_lines: list[TextLine] = Field(default_factory=list)
+    drawing_primitives: list[DrawingPrimitive] = Field(default_factory=list)
     tables: list[TableExtraction] = Field(default_factory=list)
     textract_lines: list[TextractLine] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)

@@ -57,6 +57,14 @@ Fcf_CANDIDATE_RE = re.compile(r"\b(?P<raw>(?:[a-z]{1,2}\.00\d[A-Z]?|[a-z]{1,2}Ø
 METRIC_THREAD_RE = re.compile(r"\b(?P<size>M\d+(?:\.\d+)?)\s*x\s*(?P<pitch>\d+(?:\.\d+)?)\s*-\s*(?P<class>\d+[gGhH])\b")
 UNIFIED_THREAD_RE = re.compile(r"(?<!\w)(?P<size>(?:#\d+|\d+/\d+))-(?P<tpi>\d+)\s*-\s*(?P<class>\d+[AB])\b", re.I)
 MIN_FULL_THREADS_RE = re.compile(r"\bMIN(?:IMUM|\.)?\s*(?P<count>\d+)\s*FULL\s+THREADS?\b", re.I)
+REGION_PRIORITY = {
+    "engineering_table": 100,
+    "title_block": 90,
+    "tolerance_notes": 80,
+    "thread_callout_area": 70,
+    "view_label_area": 60,
+    "drawing_body": 0,
+}
 
 
 def parse_engineering_data(raw: RawExtractionResult) -> StructuredEngineeringData:
@@ -69,7 +77,7 @@ def parse_engineering_data(raw: RawExtractionResult) -> StructuredEngineeringDat
     data.drawing_type = _parse_drawing_type(raw, all_text)
     data.bom_components = _parse_bom_components(raw)
     data.engineering_tables = _parse_engineering_tables(raw)
-    data.drawing_regions = _parse_drawing_regions(raw)
+    data.drawing_regions = _parse_drawing_regions(raw, data.engineering_tables)
     data.thread_requirements = _parse_thread_requirements(raw, data.engineering_tables, data.drawing_regions)
     data.dimensions = _parse_dimensions(raw, data.drawing_regions)
     data.connections = _parse_connections(raw, data.bom_components)
@@ -587,7 +595,7 @@ def _is_thread_or_item_chart(headers: list[str]) -> bool:
     return "item_number" in header_set and ("thread_size" in header_set or "chart_number" in header_set)
 
 
-def _parse_drawing_regions(raw: RawExtractionResult) -> list[DrawingRegion]:
+def _parse_drawing_regions(raw: RawExtractionResult, engineering_tables: list[EngineeringTable]) -> list[DrawingRegion]:
     regions: list[DrawingRegion] = []
     for page in raw.pages:
         regions.append(
@@ -605,17 +613,8 @@ def _parse_drawing_regions(raw: RawExtractionResult) -> list[DrawingRegion]:
             )
         )
         regions.extend(_regions_from_lines(page))
-        if page.tables:
-            regions.append(
-                DrawingRegion(
-                    region_id=f"page_{page.page_number}_engineering_tables",
-                    page=page.page_number,
-                    region_type="engineering_table_area",
-                    label="tables",
-                    confidence="medium",
-                    evidence="One or more native PDF tables were extracted on this page.",
-                )
-            )
+        regions.extend(_regions_from_engineering_tables(page, engineering_tables))
+        regions.extend(_regions_from_vector_primitives(page))
     return _dedupe_regions(regions)
 
 
@@ -663,6 +662,201 @@ def _regions_from_lines(page: object) -> list[DrawingRegion]:
     return regions
 
 
+
+
+def _regions_from_vector_primitives(page: object) -> list[DrawingRegion]:
+    primitives = [
+        primitive
+        for primitive in getattr(page, "drawing_primitives", [])
+        if _is_view_region_primitive(primitive, getattr(page, "page_width", 0), getattr(page, "page_height", 0))
+    ]
+    if not primitives:
+        return []
+
+    clusters = _cluster_vector_primitives(primitives)
+    page_number = getattr(page, "page_number", None)
+    page_area = float(getattr(page, "page_width", 0) or 0) * float(getattr(page, "page_height", 0) or 0)
+    regions: list[DrawingRegion] = []
+    for index, cluster in enumerate(clusters, start=1):
+        if len(cluster) < 20:
+            continue
+        x0, top, x1, bottom = _primitive_bbox(cluster)
+        width = x1 - x0
+        height = bottom - top
+        area = width * height
+        if width < 60 or height < 45:
+            continue
+        if page_area and area / page_area > 0.82:
+            continue
+        type_counts = Counter(getattr(primitive, "primitive_type", "unknown_vector") for primitive in cluster)
+        evidence = ", ".join(f"{name} x{count}" for name, count in type_counts.most_common(4))
+        regions.append(
+            DrawingRegion(
+                region_id=f"page_{page_number}_vector_view_{index}",
+                page=page_number,
+                region_type="drawing_view",
+                label=f"vector drawing view {index}",
+                x0=round(x0, 3),
+                top=round(top, 3),
+                x1=round(x1, 3),
+                bottom=round(bottom, 3),
+                confidence="medium" if len(cluster) >= 60 else "low",
+                evidence=f"{len(cluster)} vector primitives: {evidence}",
+                warnings=["Vector cluster is a drawing-view candidate, not confirmed CAD geometry."],
+            )
+        )
+    return _limit_overlapping_vector_regions(regions)
+
+
+def _is_view_region_primitive(primitive: object, page_width: float, page_height: float) -> bool:
+    primitive_type = getattr(primitive, "primitive_type", "")
+    if primitive_type in {"table_box", "unknown_vector"}:
+        return False
+    x0 = float(getattr(primitive, "x0", 0.0) or 0.0)
+    top = float(getattr(primitive, "top", 0.0) or 0.0)
+    x1 = float(getattr(primitive, "x1", 0.0) or 0.0)
+    bottom = float(getattr(primitive, "bottom", 0.0) or 0.0)
+    width = x1 - x0
+    height = bottom - top
+    if width <= 0.1 and height <= 0.1:
+        return False
+    if page_width and page_height and width * height > page_width * page_height * 0.35:
+        return False
+    return max(width, height) >= 3
+
+
+def _cluster_vector_primitives(primitives: list[object]) -> list[list[object]]:
+    cell_size = 85.0
+    cells: dict[tuple[int, int], list[object]] = {}
+    for primitive in primitives:
+        center = _primitive_center(primitive)
+        cell = (int(center[0] // cell_size), int(center[1] // cell_size))
+        cells.setdefault(cell, []).append(primitive)
+
+    dense_cells = {cell for cell, items in cells.items() if len(items) >= 6}
+    visited: set[tuple[int, int]] = set()
+    clusters: list[list[object]] = []
+    for cell in sorted(dense_cells):
+        if cell in visited:
+            continue
+        stack = [cell]
+        component_cells: set[tuple[int, int]] = set()
+        while stack:
+            current = stack.pop()
+            if current in visited or current not in dense_cells:
+                continue
+            visited.add(current)
+            component_cells.add(current)
+            cx, cy = current
+            for nx in range(cx - 1, cx + 2):
+                for ny in range(cy - 1, cy + 2):
+                    neighbor = (nx, ny)
+                    if neighbor not in visited and neighbor in dense_cells:
+                        stack.append(neighbor)
+        cluster = [primitive for component in component_cells for primitive in cells.get(component, [])]
+        if cluster:
+            clusters.append(cluster)
+    return sorted(clusters, key=lambda cluster: (_primitive_bbox(cluster)[1], _primitive_bbox(cluster)[0]))
+
+
+def _primitive_center(primitive: object) -> tuple[float, float]:
+    return (
+        (float(getattr(primitive, "x0", 0.0) or 0.0) + float(getattr(primitive, "x1", 0.0) or 0.0)) / 2,
+        (float(getattr(primitive, "top", 0.0) or 0.0) + float(getattr(primitive, "bottom", 0.0) or 0.0)) / 2,
+    )
+
+
+def _primitive_bbox(primitives: list[object]) -> tuple[float, float, float, float]:
+    return (
+        min(float(getattr(primitive, "x0", 0.0) or 0.0) for primitive in primitives),
+        min(float(getattr(primitive, "top", 0.0) or 0.0) for primitive in primitives),
+        max(float(getattr(primitive, "x1", 0.0) or 0.0) for primitive in primitives),
+        max(float(getattr(primitive, "bottom", 0.0) or 0.0) for primitive in primitives),
+    )
+
+
+def _limit_overlapping_vector_regions(regions: list[DrawingRegion]) -> list[DrawingRegion]:
+    kept: list[DrawingRegion] = []
+    for region in sorted(regions, key=lambda item: (_region_area(item), item.region_id), reverse=True):
+        if any(_region_overlap_ratio(region, existing) > 0.82 for existing in kept):
+            continue
+        kept.append(region)
+    return sorted(kept, key=lambda item: (item.top or 0.0, item.x0 or 0.0))[:12]
+
+
+def _region_area(region: DrawingRegion) -> float:
+    if None in (region.x0, region.top, region.x1, region.bottom):
+        return 0.0
+    return max(0.0, float(region.x1 or 0.0) - float(region.x0 or 0.0)) * max(0.0, float(region.bottom or 0.0) - float(region.top or 0.0))
+
+
+def _region_overlap_ratio(first: DrawingRegion, second: DrawingRegion) -> float:
+    if None in (first.x0, first.top, first.x1, first.bottom, second.x0, second.top, second.x1, second.bottom):
+        return 0.0
+    x0 = max(float(first.x0 or 0.0), float(second.x0 or 0.0))
+    top = max(float(first.top or 0.0), float(second.top or 0.0))
+    x1 = min(float(first.x1 or 0.0), float(second.x1 or 0.0))
+    bottom = min(float(first.bottom or 0.0), float(second.bottom or 0.0))
+    overlap = max(0.0, x1 - x0) * max(0.0, bottom - top)
+    smaller = min(_region_area(first), _region_area(second))
+    return overlap / smaller if smaller else 0.0
+
+def _regions_from_engineering_tables(page: object, engineering_tables: list[EngineeringTable]) -> list[DrawingRegion]:
+    page_number = getattr(page, "page_number", None)
+    if page_number is None:
+        return []
+    regions: list[DrawingRegion] = []
+    for table in engineering_tables:
+        if table.page != page_number:
+            continue
+        evidence = _engineering_table_region_evidence(table)
+        matched_lines = _lines_matching_table(page, table, evidence)
+        bbox = _line_bbox(matched_lines) if matched_lines else (None, None, None, None)
+        warnings = list(table.warnings)
+        if not matched_lines:
+            warnings.append("Table region coordinates could not be inferred from reconstructed lines.")
+        regions.append(
+            DrawingRegion(
+                region_id=f"{table.table_id or f'page_{page_number}_table'}_region",
+                page=page_number,
+                region_type="engineering_table",
+                label=table.table_type,
+                x0=bbox[0],
+                top=bbox[1],
+                x1=bbox[2],
+                bottom=bbox[3],
+                confidence="medium" if matched_lines else "low",
+                evidence=evidence,
+                warnings=warnings,
+            )
+        )
+    return regions
+
+
+def _engineering_table_region_evidence(table: EngineeringTable) -> str:
+    parts = [table.evidence or " ".join(table.headers)]
+    for row in table.rows[:4]:
+        row_text = " | ".join(value for value in row.values() if value)
+        if row_text:
+            parts.append(row_text)
+    return _compact_evidence(" || ".join(part for part in parts if part), 260)
+
+
+def _lines_matching_table(page: object, table: EngineeringTable, evidence: str) -> list[object]:
+    tokens = _region_match_tokens(evidence)
+    for row in table.rows[:4]:
+        tokens.extend(_region_match_tokens(" ".join(row.values())))
+    tokens = list(dict.fromkeys(token for token in tokens if len(token) >= 3))
+    matched = []
+    for line in getattr(page, "reconstructed_lines", []):
+        normalized = _region_match_text(getattr(line, "normalized_text", "") or getattr(line, "text", ""))
+        if not normalized:
+            continue
+        if any(token in normalized for token in tokens):
+            matched.append(line)
+    return matched[:8]
+
+
 def _line_bbox(lines: list[object]) -> tuple[float, float, float, float]:
     return (
         min(float(getattr(line, "x0", 0.0)) for line in lines),
@@ -674,14 +868,18 @@ def _line_bbox(lines: list[object]) -> tuple[float, float, float, float]:
 
 def _dedupe_regions(regions: list[DrawingRegion]) -> list[DrawingRegion]:
     deduped: list[DrawingRegion] = []
-    seen: set[tuple[int, str]] = set()
-    for region in regions:
-        key = (region.page, region.region_type)
+    seen: set[str] = set()
+    for region in sorted(regions, key=lambda item: (item.page, -_region_priority(item.region_type), item.region_id)):
+        key = region.region_id
         if key in seen:
             continue
         seen.add(key)
         deduped.append(region)
     return deduped
+
+
+def _region_priority(region_type: str) -> int:
+    return REGION_PRIORITY.get(region_type, 10)
 
 
 def _parse_thread_requirements(
@@ -763,6 +961,7 @@ def _build_engineering_requirements(data: StructuredEngineeringData) -> list[Eng
             parsed_fields=_parsed_fields_from_requirement_value(requirement_type, field.value),
             source=field.source,
             page=field.page,
+            region_id=_region_id_for_evidence(data.drawing_regions, field.page, field.evidence or field.value),
             confidence=field.confidence,
             evidence=field.evidence,
             warnings=field.warnings,
@@ -776,6 +975,7 @@ def _build_engineering_requirements(data: StructuredEngineeringData) -> list[Eng
             parsed_fields={"process": field.value},
             source=field.source,
             page=field.page,
+            region_id=_region_id_for_evidence(data.drawing_regions, field.page, field.evidence or field.value),
             confidence=field.confidence,
             evidence=field.evidence,
             warnings=field.warnings,
@@ -797,6 +997,7 @@ def _build_engineering_requirements(data: StructuredEngineeringData) -> list[Eng
             },
             source=connection.source,
             page=connection.page,
+            region_id=_region_id_for_evidence(data.drawing_regions, connection.page, connection.evidence or value),
             confidence=connection.confidence,
             evidence=connection.evidence,
             warnings=connection.warnings,
@@ -1252,24 +1453,88 @@ def _inside_compound_or_default_tolerance_context(text: str, position: int) -> b
 def _region_id_for_evidence(regions: list[DrawingRegion], page_number: int | None, evidence: str) -> str:
     if page_number is None:
         return ""
+    page_regions = [region for region in regions if region.page == page_number]
+    if not page_regions:
+        return ""
+
+    evidence_text = evidence or ""
+    preferred = _preferred_region_types_for_evidence(evidence_text)
+    matched_regions = _regions_matching_evidence(page_regions, evidence_text)
+    preferred_matches = [region for region in matched_regions if region.region_type in preferred]
+    if preferred_matches:
+        return _highest_priority_region(preferred_matches).region_id
+
+    for region_type in preferred:
+        matches = [region for region in page_regions if region.region_type == region_type]
+        if matches:
+            return _highest_priority_region(matches).region_id
+
+    drawing_body = [region for region in page_regions if region.region_type == "drawing_body"]
+    return drawing_body[0].region_id if drawing_body else ""
+
+
+def _preferred_region_types_for_evidence(evidence: str) -> list[str]:
     lowered = evidence.casefold()
+    note_tokens = (
+        "tolerance",
+        "asme",
+        "±",
+        ".xx",
+        ".xxx",
+        "chamfer:",
+        "angle:",
+        "surface finish",
+        "remove burrs",
+        "sharp edge",
+        "plating",
+        "coating",
+        "heat treatment",
+        "finish:",
+    )
+    if any(token in lowered for token in note_tokens):
+        return ["tolerance_notes", "drawing_body"]
     if any(token in lowered for token in ("model:", "dwg no", "drawn by", "created date", "approved by", "material:", "cage:", "sheet:")):
-        preferred = "title_block"
-    elif any(token in lowered for token in ("tolerance", "asme", "±", ".xx", ".xxx", "chamfer:", "angle:")):
-        preferred = "tolerance_notes"
-    elif "thread" in lowered or METRIC_THREAD_RE.search(evidence) or UNIFIED_THREAD_RE.search(evidence):
-        preferred = "thread_callout_area"
-    elif any(token in lowered for token in ("item_number", "chart_number", "thread_size")):
-        preferred = "engineering_table_area"
-    else:
-        preferred = "drawing_body"
+        return ["title_block", "drawing_body"]
+    if any(token in lowered for token in ("item_number", "chart_number", "thread_size")):
+        return ["engineering_table", "drawing_body"]
+    if "|" in evidence and (METRIC_THREAD_RE.search(evidence) or UNIFIED_THREAD_RE.search(evidence) or "thread" in lowered):
+        return ["engineering_table", "thread_callout_area", "drawing_body"]
+    if "thread" in lowered or METRIC_THREAD_RE.search(evidence) or UNIFIED_THREAD_RE.search(evidence):
+        return ["thread_callout_area", "engineering_table", "drawing_body"]
+    return ["drawing_body"]
+
+
+def _regions_matching_evidence(regions: list[DrawingRegion], evidence: str) -> list[DrawingRegion]:
+    tokens = _region_match_tokens(evidence)
+    if not tokens:
+        return []
+    matched = []
     for region in regions:
-        if region.page == page_number and region.region_type == preferred:
-            return region.region_id
-    for region in regions:
-        if region.page == page_number and region.region_type == "drawing_body":
-            return region.region_id
-    return ""
+        region_text = _region_match_text(f"{region.label} {region.evidence}")
+        if any(token in region_text for token in tokens):
+            matched.append(region)
+    return matched
+
+
+def _region_match_tokens(value: str) -> list[str]:
+    normalized = _region_match_text(value)
+    tokens = re.findall(r"[a-z0-9#./+-]+", normalized)
+    useful = []
+    for token in tokens:
+        if len(token) < 3 and not token.startswith("#"):
+            continue
+        if token in {"the", "and", "for", "with", "page", "table"}:
+            continue
+        useful.append(token)
+    return useful[:12]
+
+
+def _region_match_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value.casefold().replace("_", " ")).strip()
+
+
+def _highest_priority_region(regions: list[DrawingRegion]) -> DrawingRegion:
+    return sorted(regions, key=lambda region: (-_region_priority(region.region_type), region.region_id))[0]
 
 
 def _valid_metric_imperial_pair(metric: float, imperial: float) -> bool:
@@ -1619,6 +1884,8 @@ def _parse_drawing_structure(raw: RawExtractionResult, data: StructuredEngineeri
         "has_gdnt_requirement_candidates": bool(data.tolerances_gdnt),
         "has_process_requirements": bool(data.process_requirements),
         "has_manufacturing_requirements": bool(data.manufacturing_requirements),
+        "vector_primitive_count": sum(len(getattr(page, "drawing_primitives", [])) for page in raw.pages),
+        "vector_view_region_count": sum(1 for region in data.drawing_regions if region.region_type == "drawing_view"),
         "region_count": len(data.drawing_regions),
     }
 
