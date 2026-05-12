@@ -63,6 +63,7 @@ REGION_PRIORITY = {
     "tolerance_notes": 80,
     "thread_callout_area": 70,
     "view_label_area": 60,
+    "drawing_view": 50,
     "drawing_body": 0,
 }
 
@@ -598,7 +599,7 @@ def _is_thread_or_item_chart(headers: list[str]) -> bool:
 def _parse_drawing_regions(raw: RawExtractionResult, engineering_tables: list[EngineeringTable]) -> list[DrawingRegion]:
     regions: list[DrawingRegion] = []
     for page in raw.pages:
-        regions.append(
+        page_regions = [
             DrawingRegion(
                 region_id=f"page_{page.page_number}_drawing_body",
                 page=page.page_number,
@@ -611,10 +612,18 @@ def _parse_drawing_regions(raw: RawExtractionResult, engineering_tables: list[En
                 confidence="low",
                 evidence="Default page drawing region.",
             )
-        )
-        regions.extend(_regions_from_lines(page))
-        regions.extend(_regions_from_engineering_tables(page, engineering_tables))
-        regions.extend(_regions_from_vector_primitives(page))
+        ]
+        text_regions = _regions_from_lines(page)
+        table_regions = _regions_from_engineering_tables(page, engineering_tables)
+        vector_exclusions = [
+            region
+            for region in [*text_regions, *table_regions]
+            if region.region_type in {"title_block", "tolerance_notes"}
+        ]
+        page_regions.extend(text_regions)
+        page_regions.extend(table_regions)
+        page_regions.extend(_regions_from_vector_primitives(page, vector_exclusions))
+        regions.extend(page_regions)
     return _dedupe_regions(regions)
 
 
@@ -664,21 +673,23 @@ def _regions_from_lines(page: object) -> list[DrawingRegion]:
 
 
 
-def _regions_from_vector_primitives(page: object) -> list[DrawingRegion]:
+def _regions_from_vector_primitives(page: object, exclusion_regions: list[DrawingRegion] | None = None) -> list[DrawingRegion]:
+    exclusion_regions = exclusion_regions or []
     primitives = [
         primitive
         for primitive in getattr(page, "drawing_primitives", [])
         if _is_view_region_primitive(primitive, getattr(page, "page_width", 0), getattr(page, "page_height", 0))
+        and not _primitive_center_in_regions(primitive, exclusion_regions)
     ]
     if not primitives:
         return []
 
-    clusters = _cluster_vector_primitives(primitives)
+    clusters = _split_vector_clusters(_cluster_vector_primitives(primitives))
     page_number = getattr(page, "page_number", None)
     page_area = float(getattr(page, "page_width", 0) or 0) * float(getattr(page, "page_height", 0) or 0)
     regions: list[DrawingRegion] = []
     for index, cluster in enumerate(clusters, start=1):
-        if len(cluster) < 20:
+        if len(cluster) < 12:
             continue
         x0, top, x1, bottom = _primitive_bbox(cluster)
         width = x1 - x0
@@ -706,6 +717,11 @@ def _regions_from_vector_primitives(page: object) -> list[DrawingRegion]:
             )
         )
     return _limit_overlapping_vector_regions(regions)
+
+
+def _primitive_center_in_regions(primitive: object, regions: list[DrawingRegion]) -> bool:
+    center_x, center_y = _primitive_center(primitive)
+    return any(_point_inside_region(center_x, center_y, region, margin=8.0) for region in regions)
 
 
 def _is_view_region_primitive(primitive: object, page_width: float, page_height: float) -> bool:
@@ -757,6 +773,66 @@ def _cluster_vector_primitives(primitives: list[object]) -> list[list[object]]:
         if cluster:
             clusters.append(cluster)
     return sorted(clusters, key=lambda cluster: (_primitive_bbox(cluster)[1], _primitive_bbox(cluster)[0]))
+
+
+def _split_vector_clusters(clusters: list[list[object]]) -> list[list[object]]:
+    split_clusters: list[list[object]] = []
+    for cluster in clusters:
+        split_clusters.extend(_split_vector_cluster(cluster))
+    return sorted(split_clusters, key=lambda cluster: (_primitive_bbox(cluster)[1], _primitive_bbox(cluster)[0]))
+
+
+def _split_vector_cluster(cluster: list[object], depth: int = 0) -> list[list[object]]:
+    if depth >= 3 or len(cluster) < 40:
+        return [cluster]
+
+    bbox = _primitive_bbox(cluster)
+    width = bbox[2] - bbox[0]
+    height = bbox[3] - bbox[1]
+    axis_candidates: list[tuple[float, str, list[object], list[object]]] = []
+    for axis, span in (("x", width), ("y", height)):
+        if span < 140:
+            continue
+        split = _best_cluster_gap_split(cluster, axis, span)
+        if split is not None:
+            gap, left, right = split
+            axis_candidates.append((gap, axis, left, right))
+
+    if not axis_candidates:
+        return [cluster]
+
+    _, _, first, second = max(axis_candidates, key=lambda item: item[0])
+    return [*_split_vector_cluster(first, depth + 1), *_split_vector_cluster(second, depth + 1)]
+
+
+def _best_cluster_gap_split(
+    cluster: list[object],
+    axis: str,
+    span: float,
+) -> tuple[float, list[object], list[object]] | None:
+    indexed = sorted(cluster, key=lambda primitive: _primitive_center(primitive)[0 if axis == "x" else 1])
+    centers = [_primitive_center(primitive)[0 if axis == "x" else 1] for primitive in indexed]
+    min_side = max(12, int(len(cluster) * 0.10))
+    threshold = max(35.0, span * 0.09)
+    best: tuple[float, list[object], list[object]] | None = None
+    for index in range(min_side, len(indexed) - min_side):
+        gap = centers[index] - centers[index - 1]
+        if gap < threshold:
+            continue
+        left = indexed[:index]
+        right = indexed[index:]
+        if not _valid_split_cluster(left) or not _valid_split_cluster(right):
+            continue
+        if best is None or gap > best[0]:
+            best = (gap, left, right)
+    return best
+
+
+def _valid_split_cluster(cluster: list[object]) -> bool:
+    if len(cluster) < 12:
+        return False
+    x0, top, x1, bottom = _primitive_bbox(cluster)
+    return (x1 - x0) >= 45 and (bottom - top) >= 35
 
 
 def _primitive_center(primitive: object) -> tuple[float, float]:
@@ -1209,7 +1285,7 @@ def _parse_dimensions(raw: RawExtractionResult, regions: list[DrawingRegion]) ->
 
     for page in raw.pages:
         page_text = _page_parse_text(page)
-        for dimension in _dimension_rows(page_text, page.page_number):
+        for dimension in _dimension_rows(page_text, page.page_number, regions, page):
             key = (dimension.value, dimension.unit, dimension.imperial_value)
             if key in seen:
                 continue
@@ -1226,6 +1302,7 @@ def _parse_dimensions(raw: RawExtractionResult, regions: list[DrawingRegion]) ->
                 continue
             seen.add(key)
             role, role_confidence = _dimension_role(page.text, metric)
+            evidence = match.group(0)
             dimensions.append(
                 DimensionCandidate(
                     value=metric,
@@ -1233,12 +1310,12 @@ def _parse_dimensions(raw: RawExtractionResult, regions: list[DrawingRegion]) ->
                     imperial_value=imperial,
                     role=role,
                     role_confidence=role_confidence,
-                    region_id=_region_id_for_evidence(regions, page.page_number, match.group(0)),
-                    raw_callout=match.group(0),
-                    normalized_callout=match.group(0),
+                    region_id=_dimension_region_id(regions, page, evidence, _line_at_position(page_text, match.start())),
+                    raw_callout=evidence,
+                    normalized_callout=evidence,
                     page=page.page_number,
                     confidence="medium",
-                    evidence=match.group(0),
+                    evidence=evidence,
                 )
             )
 
@@ -1249,6 +1326,7 @@ def _parse_dimensions(raw: RawExtractionResult, regions: list[DrawingRegion]) ->
             if key not in seen:
                 seen.add(key)
                 quantity = _quantity_from_prefix(match.group("count") or "")
+                evidence = match.group(0)
                 dimensions.append(
                     DimensionCandidate(
                         value=size,
@@ -1259,12 +1337,12 @@ def _parse_dimensions(raw: RawExtractionResult, regions: list[DrawingRegion]) ->
                         angle_unit="degree",
                         role="chamfer",
                         role_confidence="high",
-                        raw_callout=match.group(0),
-                        normalized_callout=match.group(0),
-                        region_id=_region_id_for_evidence(regions, page.page_number, match.group(0)),
+                        raw_callout=evidence,
+                        normalized_callout=evidence,
+                        region_id=_dimension_region_id(regions, page, evidence, _line_at_position(page_text, match.start())),
                         page=page.page_number,
                         confidence="high",
-                        evidence=match.group(0),
+                        evidence=evidence,
                     )
                 )
 
@@ -1275,6 +1353,7 @@ def _parse_dimensions(raw: RawExtractionResult, regions: list[DrawingRegion]) ->
             if key in seen:
                 continue
             seen.add(key)
+            evidence = match.group(0)
             dimensions.append(
                 DimensionCandidate(
                     value=value,
@@ -1283,12 +1362,12 @@ def _parse_dimensions(raw: RawExtractionResult, regions: list[DrawingRegion]) ->
                     quantity=_quantity_from_prefix(match.group("count") or ""),
                     role="hole_or_diameter",
                     role_confidence="medium",
-                    raw_callout=match.group(0),
-                    normalized_callout=match.group(0),
-                    region_id=_region_id_for_evidence(regions, page.page_number, match.group(0)),
+                    raw_callout=evidence,
+                    normalized_callout=evidence,
+                    region_id=_dimension_region_id(regions, page, evidence, _line_at_position(page_text, match.start())),
                     page=page.page_number,
                     confidence="medium",
-                    evidence=match.group(0),
+                    evidence=evidence,
                 )
             )
 
@@ -1300,17 +1379,18 @@ def _parse_dimensions(raw: RawExtractionResult, regions: list[DrawingRegion]) ->
             if key in seen:
                 continue
             seen.add(key)
+            evidence = match.group(0)
             dimensions.append(
                 DimensionCandidate(
                     value=value,
                     unit="degree",
                     dimension_type="angle",
-                    raw_callout=match.group(0),
-                    normalized_callout=match.group(0),
-                    region_id=_region_id_for_evidence(regions, page.page_number, match.group(0)),
+                    raw_callout=evidence,
+                    normalized_callout=evidence,
+                    region_id=_dimension_region_id(regions, page, evidence, _line_at_position(page_text, match.start())),
                     page=page.page_number,
                     confidence="medium",
-                    evidence=match.group(0),
+                    evidence=evidence,
                 )
             )
 
@@ -1328,6 +1408,7 @@ def _parse_dimensions(raw: RawExtractionResult, regions: list[DrawingRegion]) ->
             if key in seen:
                 continue
             seen.add(key)
+            evidence = match.group(0)
             dimensions.append(
                 DimensionCandidate(
                     value=start,
@@ -1336,12 +1417,12 @@ def _parse_dimensions(raw: RawExtractionResult, regions: list[DrawingRegion]) ->
                     dimension_type="range",
                     role="range_dimension_or_allowance",
                     role_confidence="medium",
-                    raw_callout=match.group(0),
-                    normalized_callout=match.group(0),
-                    region_id=_region_id_for_evidence(regions, page.page_number, match.group(0)),
+                    raw_callout=evidence,
+                    normalized_callout=evidence,
+                    region_id=_dimension_region_id(regions, page, evidence, _line_at_position(page_text, match.start())),
                     page=page.page_number,
                     confidence="medium",
-                    evidence=match.group(0),
+                    evidence=evidence,
                     warnings=["Range stored with lower value in value and upper value in secondary_value."],
                 )
             )
@@ -1355,16 +1436,17 @@ def _parse_dimensions(raw: RawExtractionResult, regions: list[DrawingRegion]) ->
             if key in seen:
                 continue
             seen.add(key)
+            evidence = match.group(0)
             dimensions.append(
                 DimensionCandidate(
                     value=value,
                     unit="inch",
-                    raw_callout=match.group(0),
-                    normalized_callout=match.group(0),
-                    region_id=_region_id_for_evidence(regions, page.page_number, match.group(0)),
+                    raw_callout=evidence,
+                    normalized_callout=evidence,
+                    region_id=_dimension_region_id(regions, page, evidence, line_context),
                     page=page.page_number,
                     confidence="medium",
-                    evidence=match.group(0),
+                    evidence=evidence,
                 )
             )
 
@@ -1392,7 +1474,12 @@ def _line_has_excluded_dimension_context(line: str) -> bool:
     return False
 
 
-def _dimension_rows(text: str, page_number: int) -> list[DimensionCandidate]:
+def _dimension_rows(
+    text: str,
+    page_number: int,
+    regions: list[DrawingRegion],
+    page: object,
+) -> list[DimensionCandidate]:
     dimensions: list[DimensionCandidate] = []
     lines = _lines(text)
     for index, line in enumerate(lines):
@@ -1421,6 +1508,7 @@ def _dimension_rows(text: str, page_number: int) -> list[DimensionCandidate]:
                     imperial_value=imperial,
                     role="possible_envelope",
                     role_confidence="medium",
+                    region_id=_dimension_region_id(regions, page, str(metric), f"{line} {nearby[0] if nearby else ''}"),
                     page=page_number,
                     confidence="medium",
                     evidence=f"{line} / {nearby[0] if nearby else ''}",
@@ -1448,6 +1536,108 @@ def _looks_like_range_dimension(value: str) -> bool:
 def _inside_compound_or_default_tolerance_context(text: str, position: int) -> bool:
     context = text[max(0, position - 35) : position + 35].casefold()
     return any(token in context for token in ("chamfer", "angle:", " x ", "±"))
+
+
+def _dimension_region_id(regions: list[DrawingRegion], page: object, evidence: str, line_context: str = "") -> str:
+    page_number = getattr(page, "page_number", None)
+    fallback = _region_id_for_evidence(regions, page_number, evidence)
+    if page_number is None:
+        return fallback
+    if fallback and not fallback.endswith("_drawing_body"):
+        return fallback
+
+    bbox = _evidence_bbox_on_page(page, evidence, line_context)
+    if bbox is None:
+        return fallback
+
+    page_regions = [region for region in regions if region.page == page_number]
+    drawing_view = _best_drawing_view_for_bbox(page_regions, bbox)
+    if drawing_view is not None:
+        return drawing_view.region_id
+    return fallback
+
+
+def _evidence_bbox_on_page(page: object, evidence: str, line_context: str = "") -> tuple[float, float, float, float] | None:
+    lines = list(getattr(page, "reconstructed_lines", []) or [])
+    if not lines:
+        return None
+
+    context_key = _lookup_text(line_context)
+    evidence_key = _lookup_text(evidence)
+    number_tokens = re.findall(r"\d+(?:\.\d+)?", evidence_key)
+    scored: list[tuple[int, float, object]] = []
+    for line in lines:
+        line_text = _lookup_text(f"{getattr(line, 'normalized_text', '')} {getattr(line, 'text', '')}")
+        if not line_text:
+            continue
+        score = 0
+        if context_key and (context_key in line_text or line_text in context_key):
+            score += 8
+        if evidence_key and evidence_key in line_text:
+            score += 5
+        if number_tokens and any(token in line_text for token in number_tokens):
+            score += len([token for token in number_tokens if token in line_text])
+        if score:
+            area = max(1.0, (float(getattr(line, "x1", 0.0) or 0.0) - float(getattr(line, "x0", 0.0) or 0.0)) * (float(getattr(line, "bottom", 0.0) or 0.0) - float(getattr(line, "top", 0.0) or 0.0)))
+            scored.append((score, area, line))
+    if not scored:
+        return None
+
+    _, _, best = sorted(scored, key=lambda item: (-item[0], item[1]))[0]
+    return (
+        float(getattr(best, "x0", 0.0) or 0.0),
+        float(getattr(best, "top", 0.0) or 0.0),
+        float(getattr(best, "x1", 0.0) or 0.0),
+        float(getattr(best, "bottom", 0.0) or 0.0),
+    )
+
+
+def _lookup_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value.casefold().replace("ø", "o")).strip()
+
+
+def _best_drawing_view_for_bbox(regions: list[DrawingRegion], bbox: tuple[float, float, float, float]) -> DrawingRegion | None:
+    drawing_views = [region for region in regions if region.region_type == "drawing_view"]
+    if not drawing_views:
+        return None
+
+    inside = [region for region in drawing_views if _bbox_center_inside_region(bbox, region, margin=35.0)]
+    if inside:
+        return sorted(inside, key=lambda region: (_region_area(region), region.region_id))[0]
+
+    nearby: list[tuple[float, DrawingRegion]] = []
+    for region in drawing_views:
+        distance = _bbox_distance_to_region(bbox, region)
+        if distance <= 95.0:
+            nearby.append((distance, region))
+    if nearby:
+        return sorted(nearby, key=lambda item: (item[0], _region_area(item[1]), item[1].region_id))[0][1]
+    return None
+
+
+def _bbox_center_inside_region(bbox: tuple[float, float, float, float], region: DrawingRegion, margin: float = 0.0) -> bool:
+    center_x = (bbox[0] + bbox[2]) / 2
+    center_y = (bbox[1] + bbox[3]) / 2
+    return _point_inside_region(center_x, center_y, region, margin=margin)
+
+
+def _point_inside_region(x: float, y: float, region: DrawingRegion, margin: float = 0.0) -> bool:
+    if None in (region.x0, region.top, region.x1, region.bottom):
+        return False
+    return (
+        float(region.x0 or 0.0) - margin <= x <= float(region.x1 or 0.0) + margin
+        and float(region.top or 0.0) - margin <= y <= float(region.bottom or 0.0) + margin
+    )
+
+
+def _bbox_distance_to_region(bbox: tuple[float, float, float, float], region: DrawingRegion) -> float:
+    if None in (region.x0, region.top, region.x1, region.bottom):
+        return float("inf")
+    center_x = (bbox[0] + bbox[2]) / 2
+    center_y = (bbox[1] + bbox[3]) / 2
+    dx = max(float(region.x0 or 0.0) - center_x, 0.0, center_x - float(region.x1 or 0.0))
+    dy = max(float(region.top or 0.0) - center_y, 0.0, center_y - float(region.bottom or 0.0))
+    return (dx * dx + dy * dy) ** 0.5
 
 
 def _region_id_for_evidence(regions: list[DrawingRegion], page_number: int | None, evidence: str) -> str:

@@ -127,6 +127,8 @@ Flow 5: Structured engineering parsing
   |-- Parse dimensions:
   |     linear values, metric/imperial pairs, diameter,
   |     chamfer, angle, ranges
+  |     use evidence text coordinates to assign drawing_view
+  |     fall back to drawing_body when region is uncertain
   |
   |-- Parse thread requirements:
   |     M3x0.5 - 6g, #10-32 -2A,
@@ -165,6 +167,7 @@ Optional Flow 7: Bedrock vision dimension extraction
   |     reject zero/reference values
   |     reject thread-derived false dimensions
   |     merge only when value/unit/type match deterministic dimensions
+  |     assign region from matching visible text when available
   |     keep uncertain values in review_dimensions
   |
   v

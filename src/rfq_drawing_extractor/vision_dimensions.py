@@ -47,7 +47,7 @@ def augment_dimensions_with_vision_llm(
                 image_bytes=image_bytes,
             )
             dimensions = _dimensions_from_response(response, page.page_number)
-            dimensions = _validated_vision_dimensions(dimensions, page.text, data)
+            dimensions = _validated_vision_dimensions(dimensions, page, data)
             _merge_dimensions(data, dimensions)
         except Exception as exc:
             data.warnings.append(
@@ -719,13 +719,15 @@ def _matching_dimension(existing_dimensions: list[DimensionCandidate], candidate
 
 def _validated_vision_dimensions(
     candidates: list[DimensionCandidate],
-    page_text: str,
+    page: object,
     data: StructuredEngineeringData,
 ) -> list[DimensionCandidate]:
+    page_text = str(getattr(page, "text", "") or "")
     normalized_text = _normalize_numeric_text(page_text)
     text_has_content = len(normalized_text) >= 50
     validated: list[DimensionCandidate] = []
     for candidate in candidates:
+        candidate.region_id = _region_id_for_vision_candidate(data, page, candidate)
         if _is_zero_reference_dimension(candidate):
             _add_review_dimension(data, candidate, "Vision dimension looks like a zero/reference/start marker, not a usable dimension.")
             continue
@@ -748,6 +750,123 @@ def _validated_vision_dimensions(
             continue
         validated.append(candidate)
     return validated
+
+
+def _region_id_for_vision_candidate(
+    data: StructuredEngineeringData,
+    page: object,
+    candidate: DimensionCandidate,
+) -> str:
+    if candidate.region_id:
+        return candidate.region_id
+    page_number = getattr(page, "page_number", candidate.page)
+    bbox = _vision_candidate_bbox(page, candidate)
+    if bbox is None:
+        return _default_region_id_for_page(data, page_number)
+
+    page_regions = [region for region in data.drawing_regions if region.page == page_number]
+    drawing_view = _best_drawing_view_for_bbox(page_regions, bbox)
+    if drawing_view is not None:
+        return drawing_view.region_id
+    return _default_region_id_for_page(data, page_number)
+
+
+def _vision_candidate_bbox(page: object, candidate: DimensionCandidate) -> tuple[float, float, float, float] | None:
+    lookup_values = [
+        candidate.evidence,
+        candidate.raw_callout,
+        candidate.normalized_callout,
+        _format_dimension_number(candidate.value),
+    ]
+    keys = [_lookup_text(value) for value in lookup_values if value]
+    numeric_key = _format_dimension_number(candidate.value)
+    scored: list[tuple[int, float, object]] = []
+    for line in getattr(page, "reconstructed_lines", []) or []:
+        line_text = _lookup_text(f"{getattr(line, 'normalized_text', '')} {getattr(line, 'text', '')}")
+        if not line_text:
+            continue
+        score = 0
+        for key in keys:
+            if key and key in line_text:
+                score += 5
+        if numeric_key and numeric_key in line_text:
+            score += 2
+        if score:
+            area = max(1.0, (float(getattr(line, "x1", 0.0) or 0.0) - float(getattr(line, "x0", 0.0) or 0.0)) * (float(getattr(line, "bottom", 0.0) or 0.0) - float(getattr(line, "top", 0.0) or 0.0)))
+            scored.append((score, area, line))
+    if not scored:
+        return None
+    _, _, best = sorted(scored, key=lambda item: (-item[0], item[1]))[0]
+    return (
+        float(getattr(best, "x0", 0.0) or 0.0),
+        float(getattr(best, "top", 0.0) or 0.0),
+        float(getattr(best, "x1", 0.0) or 0.0),
+        float(getattr(best, "bottom", 0.0) or 0.0),
+    )
+
+
+def _best_drawing_view_for_bbox(regions: list[object], bbox: tuple[float, float, float, float]) -> object | None:
+    drawing_views = [region for region in regions if getattr(region, "region_type", "") == "drawing_view"]
+    inside = [region for region in drawing_views if _bbox_center_inside_region(bbox, region, margin=35.0)]
+    if inside:
+        return sorted(inside, key=lambda region: (_region_area(region), getattr(region, "region_id", "")))[0]
+    nearby = []
+    for region in drawing_views:
+        distance = _bbox_distance_to_region(bbox, region)
+        if distance <= 95.0:
+            nearby.append((distance, region))
+    if nearby:
+        return sorted(nearby, key=lambda item: (item[0], _region_area(item[1]), getattr(item[1], "region_id", "")))[0][1]
+    return None
+
+
+def _bbox_center_inside_region(bbox: tuple[float, float, float, float], region: object, margin: float = 0.0) -> bool:
+    center_x = (bbox[0] + bbox[2]) / 2
+    center_y = (bbox[1] + bbox[3]) / 2
+    if None in (getattr(region, "x0", None), getattr(region, "top", None), getattr(region, "x1", None), getattr(region, "bottom", None)):
+        return False
+    return (
+        float(getattr(region, "x0") or 0.0) - margin <= center_x <= float(getattr(region, "x1") or 0.0) + margin
+        and float(getattr(region, "top") or 0.0) - margin <= center_y <= float(getattr(region, "bottom") or 0.0) + margin
+    )
+
+
+def _bbox_distance_to_region(bbox: tuple[float, float, float, float], region: object) -> float:
+    if None in (getattr(region, "x0", None), getattr(region, "top", None), getattr(region, "x1", None), getattr(region, "bottom", None)):
+        return float("inf")
+    center_x = (bbox[0] + bbox[2]) / 2
+    center_y = (bbox[1] + bbox[3]) / 2
+    dx = max(float(getattr(region, "x0") or 0.0) - center_x, 0.0, center_x - float(getattr(region, "x1") or 0.0))
+    dy = max(float(getattr(region, "top") or 0.0) - center_y, 0.0, center_y - float(getattr(region, "bottom") or 0.0))
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _region_area(region: object) -> float:
+    if None in (getattr(region, "x0", None), getattr(region, "top", None), getattr(region, "x1", None), getattr(region, "bottom", None)):
+        return 0.0
+    return max(0.0, float(getattr(region, "x1") or 0.0) - float(getattr(region, "x0") or 0.0)) * max(0.0, float(getattr(region, "bottom") or 0.0) - float(getattr(region, "top") or 0.0))
+
+
+def _region_priority(region_type: str) -> int:
+    return {
+        "engineering_table": 100,
+        "title_block": 90,
+        "tolerance_notes": 80,
+        "thread_callout_area": 70,
+        "drawing_view": 50,
+        "drawing_body": 0,
+    }.get(region_type, 0)
+
+
+def _lookup_text(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value).casefold().replace("ø", "o")).strip()
+
+
+def _format_dimension_number(value: float) -> str:
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    if 0 < abs(value) < 1 and text.startswith("0."):
+        return text[1:]
+    return text
 
 
 def _add_review_dimension(
