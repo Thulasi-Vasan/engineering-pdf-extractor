@@ -47,6 +47,7 @@ def augment_dimensions_with_vision_llm(
                 image_bytes=image_bytes,
             )
             dimensions = _dimensions_from_response(response, page.page_number)
+            dimensions = _validated_vision_dimensions(dimensions, page, data)
             _merge_dimensions(data, dimensions)
         except Exception as exc:
             data.warnings.append(
@@ -66,6 +67,8 @@ def augment_dimensions_with_vision_llm(
             data.warnings.append(
                 f"Bedrock vision envelope extraction failed on page {page.page_number}: {exc}"
             )
+
+    data.drawing_structure["has_review_dimensions"] = bool(data.review_dimensions)
 
 
 def _render_pages_to_png(pdf_path: Path, page_numbers: list[int]) -> dict[int, bytes]:
@@ -502,15 +505,16 @@ def _normalize_numeric_text(text: str) -> str:
 def _number_visible_in_text(value: float, normalized_text: str) -> bool:
     candidates = {
         f"{value:g}",
-        f"{value:.1f}".rstrip("0").rstrip("."),
         f"{value:.2f}".rstrip("0").rstrip("."),
         f"{value:.3f}".rstrip("0").rstrip("."),
         f"{value:.3f}",
     }
+    if abs(value) >= 1:
+        candidates.add(f"{value:.1f}".rstrip("0").rstrip("."))
     for candidate in candidates:
         if not candidate:
             continue
-        pattern = rf"(?<![0-9.]){re.escape(candidate)}(?![0-9.])"
+        pattern = rf"(?<![A-Za-z0-9.#]){re.escape(candidate)}(?![A-Za-z0-9.])"
         if re.search(pattern, normalized_text):
             return True
     return False
@@ -668,19 +672,30 @@ def _envelope_score(envelope: OverallEnvelope) -> int:
 
 def _merge_dimensions(data: StructuredEngineeringData, candidates: list[DimensionCandidate]) -> None:
     for candidate in candidates:
+        if not candidate.region_id:
+            candidate.region_id = _default_region_id_for_page(data, candidate.page)
         existing = _matching_dimension(data.dimensions, candidate)
         if existing is None:
             data.dimensions.append(candidate)
             continue
 
-        existing.source = "mixed"
+        if not existing.region_id:
+            existing.region_id = candidate.region_id or _default_region_id_for_page(data, existing.page)
+        existing_source = existing.source
+        existing_confidence = existing.confidence
+        if existing.source != candidate.source:
+            existing.source = "mixed"
         existing.confidence = _higher_confidence(existing.confidence, candidate.confidence)  # type: ignore[assignment]
         if existing.role == "unknown" and candidate.role != "unknown":
             existing.role = candidate.role
             existing.role_confidence = candidate.role_confidence
         if existing.imperial_value is None and candidate.imperial_value is not None:
             existing.imperial_value = candidate.imperial_value
-        if candidate.evidence and candidate.evidence not in existing.evidence:
+        if existing_source == "text" and existing_confidence == "high" and candidate.source == "vision_llm":
+            warning = f"Vision also found a matching dimension candidate: {candidate.evidence}"
+            if warning not in existing.warnings:
+                existing.warnings.append(warning)
+        elif candidate.evidence and candidate.evidence not in existing.evidence:
             existing.evidence = (existing.evidence + " | Vision: " + candidate.evidence).strip(" |")
         for warning in candidate.warnings:
             if warning not in existing.warnings:
@@ -689,6 +704,8 @@ def _merge_dimensions(data: StructuredEngineeringData, candidates: list[Dimensio
 
 def _matching_dimension(existing_dimensions: list[DimensionCandidate], candidate: DimensionCandidate) -> DimensionCandidate | None:
     for existing in existing_dimensions:
+        if not _dimension_types_compatible(existing, candidate):
+            continue
         if existing.unit != candidate.unit:
             continue
         if abs(existing.value - candidate.value) > _dimension_tolerance(candidate):
@@ -700,11 +717,231 @@ def _matching_dimension(existing_dimensions: list[DimensionCandidate], candidate
     return None
 
 
+def _validated_vision_dimensions(
+    candidates: list[DimensionCandidate],
+    page: object,
+    data: StructuredEngineeringData,
+) -> list[DimensionCandidate]:
+    page_text = str(getattr(page, "text", "") or "")
+    normalized_text = _normalize_numeric_text(page_text)
+    text_has_content = len(normalized_text) >= 50
+    validated: list[DimensionCandidate] = []
+    for candidate in candidates:
+        candidate.region_id = _region_id_for_vision_candidate(data, page, candidate)
+        if _is_zero_reference_dimension(candidate):
+            _add_review_dimension(data, candidate, "Vision dimension looks like a zero/reference/start marker, not a usable dimension.")
+            continue
+        if _is_thread_derived_false_dimension(candidate, page_text):
+            _add_review_dimension(data, candidate, "Vision dimension appears to come from thread notation, not a standalone drawing dimension.")
+            continue
+
+        matched_existing = _matching_dimension(data.dimensions, candidate)
+        if matched_existing is None and candidate.unit == "unknown":
+            _add_review_dimension(data, candidate, "Vision-only dimension has unknown unit and does not match an existing deterministic dimension.")
+            continue
+        value_visible = _number_visible_in_text(candidate.value, normalized_text)
+        if text_has_content and matched_existing is None and not value_visible:
+            candidate.confidence = "review"
+            candidate.role_confidence = "review"
+            warning = "Vision-only dimension value was not found in native/reconstructed PDF text."
+            if warning not in candidate.warnings:
+                candidate.warnings.append(warning)
+            _add_review_dimension(data, candidate)
+            continue
+        validated.append(candidate)
+    return validated
+
+
+def _region_id_for_vision_candidate(
+    data: StructuredEngineeringData,
+    page: object,
+    candidate: DimensionCandidate,
+) -> str:
+    if candidate.region_id:
+        return candidate.region_id
+    page_number = getattr(page, "page_number", candidate.page)
+    bbox = _vision_candidate_bbox(page, candidate)
+    if bbox is None:
+        return _default_region_id_for_page(data, page_number)
+
+    page_regions = [region for region in data.drawing_regions if region.page == page_number]
+    drawing_view = _best_drawing_view_for_bbox(page_regions, bbox)
+    if drawing_view is not None:
+        return drawing_view.region_id
+    return _default_region_id_for_page(data, page_number)
+
+
+def _vision_candidate_bbox(page: object, candidate: DimensionCandidate) -> tuple[float, float, float, float] | None:
+    lookup_values = [
+        candidate.evidence,
+        candidate.raw_callout,
+        candidate.normalized_callout,
+        _format_dimension_number(candidate.value),
+    ]
+    keys = [_lookup_text(value) for value in lookup_values if value]
+    numeric_key = _format_dimension_number(candidate.value)
+    scored: list[tuple[int, float, object]] = []
+    for line in getattr(page, "reconstructed_lines", []) or []:
+        line_text = _lookup_text(f"{getattr(line, 'normalized_text', '')} {getattr(line, 'text', '')}")
+        if not line_text:
+            continue
+        score = 0
+        for key in keys:
+            if key and key in line_text:
+                score += 5
+        if numeric_key and numeric_key in line_text:
+            score += 2
+        if score:
+            area = max(1.0, (float(getattr(line, "x1", 0.0) or 0.0) - float(getattr(line, "x0", 0.0) or 0.0)) * (float(getattr(line, "bottom", 0.0) or 0.0) - float(getattr(line, "top", 0.0) or 0.0)))
+            scored.append((score, area, line))
+    if not scored:
+        return None
+    _, _, best = sorted(scored, key=lambda item: (-item[0], item[1]))[0]
+    return (
+        float(getattr(best, "x0", 0.0) or 0.0),
+        float(getattr(best, "top", 0.0) or 0.0),
+        float(getattr(best, "x1", 0.0) or 0.0),
+        float(getattr(best, "bottom", 0.0) or 0.0),
+    )
+
+
+def _best_drawing_view_for_bbox(regions: list[object], bbox: tuple[float, float, float, float]) -> object | None:
+    drawing_views = [region for region in regions if getattr(region, "region_type", "") == "drawing_view"]
+    inside = [region for region in drawing_views if _bbox_center_inside_region(bbox, region, margin=35.0)]
+    if inside:
+        return sorted(inside, key=lambda region: (_region_area(region), getattr(region, "region_id", "")))[0]
+    nearby = []
+    for region in drawing_views:
+        distance = _bbox_distance_to_region(bbox, region)
+        if distance <= 95.0:
+            nearby.append((distance, region))
+    if nearby:
+        return sorted(nearby, key=lambda item: (item[0], _region_area(item[1]), getattr(item[1], "region_id", "")))[0][1]
+    return None
+
+
+def _bbox_center_inside_region(bbox: tuple[float, float, float, float], region: object, margin: float = 0.0) -> bool:
+    center_x = (bbox[0] + bbox[2]) / 2
+    center_y = (bbox[1] + bbox[3]) / 2
+    if None in (getattr(region, "x0", None), getattr(region, "top", None), getattr(region, "x1", None), getattr(region, "bottom", None)):
+        return False
+    return (
+        float(getattr(region, "x0") or 0.0) - margin <= center_x <= float(getattr(region, "x1") or 0.0) + margin
+        and float(getattr(region, "top") or 0.0) - margin <= center_y <= float(getattr(region, "bottom") or 0.0) + margin
+    )
+
+
+def _bbox_distance_to_region(bbox: tuple[float, float, float, float], region: object) -> float:
+    if None in (getattr(region, "x0", None), getattr(region, "top", None), getattr(region, "x1", None), getattr(region, "bottom", None)):
+        return float("inf")
+    center_x = (bbox[0] + bbox[2]) / 2
+    center_y = (bbox[1] + bbox[3]) / 2
+    dx = max(float(getattr(region, "x0") or 0.0) - center_x, 0.0, center_x - float(getattr(region, "x1") or 0.0))
+    dy = max(float(getattr(region, "top") or 0.0) - center_y, 0.0, center_y - float(getattr(region, "bottom") or 0.0))
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _region_area(region: object) -> float:
+    if None in (getattr(region, "x0", None), getattr(region, "top", None), getattr(region, "x1", None), getattr(region, "bottom", None)):
+        return 0.0
+    return max(0.0, float(getattr(region, "x1") or 0.0) - float(getattr(region, "x0") or 0.0)) * max(0.0, float(getattr(region, "bottom") or 0.0) - float(getattr(region, "top") or 0.0))
+
+
+def _region_priority(region_type: str) -> int:
+    return {
+        "engineering_table": 100,
+        "title_block": 90,
+        "tolerance_notes": 80,
+        "thread_callout_area": 70,
+        "drawing_view": 50,
+        "drawing_body": 0,
+    }.get(region_type, 0)
+
+
+def _lookup_text(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value).casefold().replace("ø", "o")).strip()
+
+
+def _format_dimension_number(value: float) -> str:
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    if 0 < abs(value) < 1 and text.startswith("0."):
+        return text[1:]
+    return text
+
+
+def _add_review_dimension(
+    data: StructuredEngineeringData,
+    candidate: DimensionCandidate,
+    warning: str = "",
+) -> None:
+    candidate.confidence = "review"
+    candidate.role_confidence = "review"
+    if not candidate.region_id:
+        candidate.region_id = _default_region_id_for_page(data, candidate.page)
+    if warning and warning not in candidate.warnings:
+        candidate.warnings.append(warning)
+    key = _dimension_review_key(candidate)
+    if all(_dimension_review_key(existing) != key for existing in data.review_dimensions):
+        data.review_dimensions.append(candidate)
+
+
+def _default_region_id_for_page(data: StructuredEngineeringData, page_number: int | None) -> str:
+    if page_number is None:
+        return ""
+    for region in data.drawing_regions:
+        if region.page == page_number and region.region_type == "drawing_body":
+            return region.region_id
+    return ""
+
+
+def _dimension_review_key(candidate: DimensionCandidate) -> tuple[float, str, str, str]:
+    return (
+        round(candidate.value, 6),
+        candidate.unit,
+        candidate.dimension_type.casefold(),
+        candidate.evidence.casefold(),
+    )
+
+
+def _is_zero_reference_dimension(candidate: DimensionCandidate) -> bool:
+    if abs(candidate.value) > 1e-9:
+        return False
+    if candidate.source == "vision_llm" and candidate.dimension_type == "linear":
+        return True
+    text = f"{candidate.role} {candidate.evidence} {candidate.raw_callout}".casefold()
+    return any(token in text for token in ("start", "origin", "reference", "baseline", "datum"))
+
+
+def _is_thread_derived_false_dimension(candidate: DimensionCandidate, page_text: str) -> bool:
+    text = f"{candidate.role} {candidate.evidence} {candidate.raw_callout}".casefold()
+    if "thread" in text:
+        return True
+    if candidate.unit != "mm" or abs(candidate.value - round(candidate.value)) > 1e-9:
+        return False
+    major = int(round(candidate.value))
+    return bool(re.search(rf"\bM{major}(?:\s*x|x|-)?", page_text, re.I))
+
+
+def _dimension_types_compatible(existing: DimensionCandidate, candidate: DimensionCandidate) -> bool:
+    existing_type = (existing.dimension_type or "linear").casefold()
+    candidate_type = (candidate.dimension_type or "linear").casefold()
+    if existing_type == candidate_type:
+        return True
+    if "unknown" in {existing_type, candidate_type}:
+        return True
+    special_types = {"diameter", "radius", "chamfer", "angle"}
+    if existing_type in special_types or candidate_type in special_types:
+        return False
+    return existing_type == "linear" and candidate_type == "linear"
+
+
 def _dimension_tolerance(candidate: DimensionCandidate) -> float:
     if candidate.unit == "degree":
         return 0.2
     if abs(candidate.value) >= 100:
         return 0.5
+    if abs(candidate.value) < 1:
+        return 0.003
     return 0.15
 
 
@@ -763,5 +1000,5 @@ def _combined_axis_confidence(envelope: OverallEnvelope) -> str:
 
 
 def _higher_confidence(left: str, right: str) -> str:
-    order = {"low": 0, "medium": 1, "high": 2}
+    order = {"low": 0, "review": 1, "medium": 2, "high": 3}
     return left if order.get(left, 0) >= order.get(right, 0) else right

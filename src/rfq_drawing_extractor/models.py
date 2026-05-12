@@ -10,8 +10,8 @@ from pydantic import BaseModel, Field
 PageType = Literal["text_page", "image_page", "hybrid_page", "empty_or_unknown_page"]
 PdfType = Literal["text_vector_pdf", "scanned_image_pdf", "hybrid_pdf", "unreadable_pdf"]
 ExtractionMethod = Literal["text", "ocr", "mixed", "none"]
-SourceType = Literal["text", "ocr", "mixed", "inferred", "vision_llm"]
-ConfidenceLabel = Literal["high", "medium", "low"]
+SourceType = Literal["text", "ocr", "mixed", "inferred", "vision_llm", "vector"]
+ConfidenceLabel = Literal["high", "medium", "low", "review"]
 
 
 class RunMetadata(BaseModel):
@@ -83,6 +83,36 @@ class TextractLine(BaseModel):
     height: float
 
 
+class TextLine(BaseModel):
+    text: str
+    normalized_text: str = ""
+    x0: float
+    top: float
+    x1: float
+    bottom: float
+    page: int | None = None
+    source: Literal["text", "ocr", "mixed"] = "text"
+    confidence: float = 1.0
+    warnings: list[str] = Field(default_factory=list)
+
+
+class DrawingPrimitive(BaseModel):
+    page: int
+    primitive_type: str = "unknown_vector"
+    path_type: str = ""
+    x0: float
+    top: float
+    x1: float
+    bottom: float
+    stroke_color: str = ""
+    fill_color: str = ""
+    line_width: float | None = None
+    item_count: int = 0
+    source: SourceType = "vector"
+    confidence: ConfidenceLabel = "low"
+    warnings: list[str] = Field(default_factory=list)
+
+
 class PageExtraction(BaseModel):
     page_number: int
     page_type: PageType
@@ -92,6 +122,8 @@ class PageExtraction(BaseModel):
     page_width: float
     page_height: float
     words: list[WordBox] = Field(default_factory=list)
+    reconstructed_lines: list[TextLine] = Field(default_factory=list)
+    drawing_primitives: list[DrawingPrimitive] = Field(default_factory=list)
     tables: list[TableExtraction] = Field(default_factory=list)
     textract_lines: list[TextractLine] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
@@ -130,10 +162,17 @@ class BomComponent(BaseModel):
 class DimensionCandidate(BaseModel):
     value: float
     unit: Literal["mm", "inch", "degree", "unknown"] = "unknown"
+    secondary_value: float | None = None
     imperial_value: float | None = None
     dimension_type: str = "linear"
+    quantity: int | None = None
+    angle_value: float | None = None
+    angle_unit: Literal["degree", "unknown"] = "unknown"
     role: str = "unknown"
     role_confidence: ConfidenceLabel = "low"
+    raw_callout: str = ""
+    normalized_callout: str = ""
+    region_id: str = ""
     source: SourceType = "text"
     page: int | None = None
     confidence: ConfidenceLabel = "medium"
@@ -149,6 +188,65 @@ class ConnectionCandidate(BaseModel):
     source: SourceType = "text"
     page: int | None = None
     confidence: ConfidenceLabel = "medium"
+    evidence: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
+class EngineeringTable(BaseModel):
+    table_type: str
+    table_id: str = ""
+    table_index: int | None = None
+    headers: list[str] = Field(default_factory=list)
+    rows: list[dict[str, str]] = Field(default_factory=list)
+    source: SourceType = "text"
+    page: int | None = None
+    confidence: ConfidenceLabel = "medium"
+    evidence: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
+class EngineeringRequirement(BaseModel):
+    requirement_type: str
+    value: str
+    parsed_fields: dict[str, Any] = Field(default_factory=dict)
+    source: SourceType = "text"
+    page: int | None = None
+    region_id: str = ""
+    confidence: ConfidenceLabel = "medium"
+    evidence: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ThreadRequirement(BaseModel):
+    thread_size: str = ""
+    pitch: float | None = None
+    threads_per_inch: int | None = None
+    thread_class: str = ""
+    quantity: int | None = None
+    minimum_full_threads: int | None = None
+    label: str = ""
+    relief_note: str = ""
+    chart_reference: str = ""
+    source_table: str = ""
+    source: SourceType = "text"
+    page: int | None = None
+    region_id: str = ""
+    confidence: ConfidenceLabel = "medium"
+    evidence: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
+class DrawingRegion(BaseModel):
+    region_id: str
+    page: int
+    region_type: str
+    label: str = ""
+    x0: float | None = None
+    top: float | None = None
+    x1: float | None = None
+    bottom: float | None = None
+    source: SourceType = "inferred"
+    confidence: ConfidenceLabel = "low"
     evidence: str = ""
     warnings: list[str] = Field(default_factory=list)
 
@@ -194,12 +292,18 @@ class StructuredEngineeringData(BaseModel):
     units: ExtractedField | None = None
     standards: list[ExtractedField] = Field(default_factory=list)
     bom_components: list[BomComponent] = Field(default_factory=list)
+    engineering_tables: list[EngineeringTable] = Field(default_factory=list)
+    engineering_requirements: list[EngineeringRequirement] = Field(default_factory=list)
+    thread_requirements: list[ThreadRequirement] = Field(default_factory=list)
     dimensions: list[DimensionCandidate] = Field(default_factory=list)
+    review_dimensions: list[DimensionCandidate] = Field(default_factory=list)
     connections: list[ConnectionCandidate] = Field(default_factory=list)
     notes: list[ExtractedField] = Field(default_factory=list)
+    drawing_regions: list[DrawingRegion] = Field(default_factory=list)
     drawing_structure: dict[str, Any] = Field(default_factory=dict)
     tolerances_gdnt: list[ExtractedField] = Field(default_factory=list)
     process_requirements: list[ExtractedField] = Field(default_factory=list)
+    manufacturing_requirements: list[ExtractedField] = Field(default_factory=list)
     overall_envelope: OverallEnvelope = Field(default_factory=OverallEnvelope)
     semantic_summary: str = ""
     warnings: list[str] = Field(default_factory=list)
