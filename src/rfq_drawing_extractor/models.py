@@ -322,11 +322,21 @@ class LLMReviewItem(BaseModel):
 class LLMFinalDimension(BaseModel):
     value: Any = None
     unit: str = ""
+    secondary_value: Any = None
+    imperial_value: Any = None
+    dimension_type: str = ""
+    quantity: int | None = None
+    angle_value: float | None = None
+    angle_unit: str = ""
+    role: str = ""
+    role_confidence: ConfidenceLabel = "review"
     raw_callout: str = ""
+    normalized_callout: str = ""
     label: str = ""
     description: str = ""
     view_label: str = ""
     region_id: str = ""
+    source: str = ""
     page: int | None = None
     confidence: ConfidenceLabel = "review"
     evidence: str = ""

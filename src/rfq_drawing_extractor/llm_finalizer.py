@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from pydantic import ValidationError
 
 from .models import (
+    LLMFinalDimension,
     LLMFinalEngineeringData,
     LLMFinalizationResult,
     LLMReviewItem,
@@ -44,6 +45,7 @@ def finalize_engineering_data_with_llm(
             model=selected_model,
             response_text=response_text,
         )
+        _complete_final_data_from_structured(final_data, structured)
         _apply_evidence_guardrails(final_data)
         return LLMFinalizationResult(
             status="success",
@@ -165,7 +167,7 @@ def _finalizer_prompt(context: dict[str, Any]) -> str:
         '  "drawing_type": null,\n'
         '  "units": null,\n'
         '  "dimensions": [\n'
-        '    {"value": null, "unit": "", "raw_callout": "", "label": "", "description": "", "view_label": "", "region_id": "", "page": null, "confidence": "review", "evidence": "", "warnings": []}\n'
+        '    {"value": null, "unit": "", "secondary_value": null, "imperial_value": null, "dimension_type": "", "quantity": null, "angle_value": null, "angle_unit": "", "role": "", "role_confidence": "review", "raw_callout": "", "normalized_callout": "", "label": "", "description": "", "view_label": "", "region_id": "", "source": "", "page": null, "confidence": "review", "evidence": "", "warnings": []}\n'
         "  ],\n"
         '  "threads": [\n'
         '    {"thread_size": "", "pitch": null, "threads_per_inch": null, "thread_class": "", "source_type": "", "label": "", "region_id": "", "page": null, "confidence": "review", "evidence": "", "warnings": []}\n'
@@ -185,6 +187,8 @@ def _finalizer_prompt(context: dict[str, Any]) -> str:
         '  "warnings": []\n'
         "}\n\n"
         "Rules:\n"
+        "- For dimensions, preserve every deterministic field from deterministic_summary.dimensions when the field exists.\n"
+        "- Add semantic dimension label, description, and view_label; do not remove raw deterministic fields to make the output shorter.\n"
         "- Preserve evidence text, page numbers, region_id, confidence, and warnings where available.\n"
         "- Use review_items for low-confidence, vision-only, unclear, unsupported, or conflicting values.\n"
         "- Keep dimensions as visible drawing dimensions only; exclude title block numbers, phone numbers, dates, and BOM item numbers.\n"
@@ -343,6 +347,167 @@ def _call_bedrock_json_repair(*, model: str, invalid_json: str, error: str) -> s
         inferenceConfig={"maxTokens": 10000, "temperature": 0},
     )
     return _bedrock_output_text(response)
+
+
+def _complete_final_data_from_structured(
+    final_data: LLMFinalEngineeringData,
+    structured: StructuredEngineeringData,
+) -> None:
+    deterministic_dimensions = _dump_jsonable(structured.dimensions)
+    if not isinstance(deterministic_dimensions, list):
+        return
+
+    used_indexes: set[int] = set()
+    completed_dimensions: list[LLMFinalDimension] = []
+    for dimension in final_data.dimensions:
+        match_index, match = _best_dimension_match(dimension, deterministic_dimensions, used_indexes)
+        if match is None:
+            dimension.warnings.append(
+                "Could not match this LLM dimension to a deterministic structured dimension."
+            )
+            if dimension.confidence != "review":
+                dimension.confidence = "review"
+            final_data.review_items.append(
+                LLMReviewItem(
+                    item_type="dimension",
+                    value=dimension.raw_callout or dimension.value,
+                    confidence="review",
+                    evidence=dimension.evidence,
+                    page=dimension.page,
+                    reason="LLM finalizer returned a dimension that could not be grounded to structured data.",
+                    warnings=["Review before using this dimension for form filling."],
+                )
+            )
+            completed_dimensions.append(dimension)
+            continue
+
+        used_indexes.add(match_index)
+        completed_dimensions.append(_merge_dimension_with_structured(dimension, match))
+
+    for index, deterministic_dimension in enumerate(deterministic_dimensions):
+        if index in used_indexes or not isinstance(deterministic_dimension, dict):
+            continue
+        added_dimension = _dimension_from_structured(deterministic_dimension)
+        added_dimension.warnings.append(
+            "Added from deterministic structured data because the LLM finalizer omitted this dimension."
+        )
+        completed_dimensions.append(added_dimension)
+
+    final_data.dimensions = completed_dimensions
+
+
+def _best_dimension_match(
+    dimension: LLMFinalDimension,
+    candidates: list[Any],
+    used_indexes: set[int],
+) -> tuple[int, dict[str, Any] | None]:
+    best_index = -1
+    best_score = 0
+    for index, candidate in enumerate(candidates):
+        if index in used_indexes or not isinstance(candidate, dict):
+            continue
+        score = _dimension_match_score(dimension, candidate)
+        if score > best_score:
+            best_index = index
+            best_score = score
+
+    if best_index == -1 or best_score < 4:
+        return -1, None
+    return best_index, candidates[best_index]
+
+
+def _dimension_match_score(dimension: LLMFinalDimension, candidate: dict[str, Any]) -> int:
+    score = 0
+    if dimension.page is not None and dimension.page == candidate.get("page"):
+        score += 2
+    if _same_non_empty(dimension.region_id, candidate.get("region_id")):
+        score += 2
+    if _same_non_empty(dimension.raw_callout, candidate.get("raw_callout")):
+        score += 5
+    if _same_non_empty(dimension.evidence, candidate.get("evidence")):
+        score += 4
+    if _same_non_empty(dimension.normalized_callout, candidate.get("normalized_callout")):
+        score += 4
+    if _same_number(dimension.value, candidate.get("value")):
+        score += 2
+    if _same_non_empty(dimension.unit, candidate.get("unit")):
+        score += 1
+    return score
+
+
+def _merge_dimension_with_structured(
+    llm_dimension: LLMFinalDimension,
+    deterministic_dimension: dict[str, Any],
+) -> LLMFinalDimension:
+    semantic_fields = {
+        "label": llm_dimension.label,
+        "description": llm_dimension.description,
+        "view_label": llm_dimension.view_label,
+    }
+    merged = _dimension_from_structured(deterministic_dimension)
+    merged.label = semantic_fields["label"]
+    merged.description = semantic_fields["description"]
+    merged.view_label = semantic_fields["view_label"]
+    merged.warnings = _merge_warnings(
+        deterministic_dimension.get("warnings", []),
+        llm_dimension.warnings,
+    )
+    return merged
+
+
+def _dimension_from_structured(dimension: dict[str, Any]) -> LLMFinalDimension:
+    return LLMFinalDimension(
+        value=dimension.get("value"),
+        unit=str(dimension.get("unit") or ""),
+        secondary_value=dimension.get("secondary_value"),
+        imperial_value=dimension.get("imperial_value"),
+        dimension_type=str(dimension.get("dimension_type") or ""),
+        quantity=dimension.get("quantity"),
+        angle_value=dimension.get("angle_value"),
+        angle_unit=str(dimension.get("angle_unit") or ""),
+        role=str(dimension.get("role") or ""),
+        role_confidence=dimension.get("role_confidence") or "review",
+        raw_callout=str(dimension.get("raw_callout") or ""),
+        normalized_callout=str(dimension.get("normalized_callout") or ""),
+        region_id=str(dimension.get("region_id") or ""),
+        source=str(dimension.get("source") or ""),
+        page=dimension.get("page"),
+        confidence=dimension.get("confidence") or "review",
+        evidence=str(dimension.get("evidence") or ""),
+        warnings=list(dimension.get("warnings") or []),
+    )
+
+
+def _same_non_empty(left: Any, right: Any) -> bool:
+    left_text = _match_text(left)
+    right_text = _match_text(right)
+    return bool(left_text and right_text and left_text == right_text)
+
+
+def _match_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().lower()
+
+
+def _same_number(left: Any, right: Any) -> bool:
+    try:
+        return abs(float(left) - float(right)) < 0.000001
+    except (TypeError, ValueError):
+        return False
+
+
+def _merge_warnings(*warning_lists: Any) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for warning_list in warning_lists:
+        if not isinstance(warning_list, list):
+            continue
+        for warning in warning_list:
+            text = str(warning)
+            if text in seen:
+                continue
+            seen.add(text)
+            merged.append(text)
+    return merged
 
 
 def _apply_evidence_guardrails(final_data: LLMFinalEngineeringData) -> None:
