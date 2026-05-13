@@ -33,15 +33,23 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
   const [activeTab, setActiveTab] = useState<Tab>('final_json');
   const [copied, setCopied] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
+  const finalJsonPayload = (
+    result.final_json &&
+    typeof result.final_json === 'object' &&
+    'final_data' in result.final_json
+  )
+    ? result.final_json.final_data
+    : result.final_json;
+  const displayJson = finalJsonPayload ?? result.final_json ?? {};
 
   const handleCopyJson = () => {
-    navigator.clipboard.writeText(JSON.stringify(result.final_json, null, 2));
+    navigator.clipboard.writeText(JSON.stringify(displayJson, null, 2));
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
   const handleDownloadJson = () => {
-    const blob = new Blob([JSON.stringify(result.final_json, null, 2)], { type: 'application/json' });
+    const blob = new Blob([JSON.stringify(displayJson, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -163,7 +171,7 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
                   lineHeight: '1.6'
                 }}
               >
-                {JSON.stringify(result.final_json, null, 2)}
+                {JSON.stringify(displayJson, null, 2)}
               </SyntaxHighlighter>
             </div>
           </div>
@@ -176,7 +184,7 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
               Generated Artifacts
             </h3>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {Object.entries(result.artifacts).map(([key, path]) => {
+              {Object.entries(result.artifacts).filter((entry): entry is [string, string] => Boolean(entry[1])).map(([key, path]) => {
                 const Icon = artifactIcons[key] || FileText;
                 return (
                   <a

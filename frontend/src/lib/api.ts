@@ -2,7 +2,7 @@
  * API Utility for Engineering PDF Extractor Backend
  */
 
-export const BASE_URL = 'http://127.0.0.1:8000';
+export const BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
 
 export interface ExtractionRequest {
   file: File;
@@ -16,14 +16,14 @@ export interface Artifacts {
   page_detection: string;
   raw_extraction: string;
   structured_data: string;
-  final_json: string;
+  final_json: string | null;
   report: string;
 }
 
 export interface ExtractionResponse {
   run_id: string;
   status: 'success' | 'failed' | 'partial_success';
-  final_json: Record<string, unknown>;
+  final_json: Record<string, unknown> | null;
   artifacts: Artifacts;
   warnings: string[];
   error?: string;
