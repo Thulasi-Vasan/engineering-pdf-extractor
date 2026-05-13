@@ -22,6 +22,7 @@ def extract_raw_content(pdf_path: Path, detection: PageDetectionResult) -> RawEx
 
     with pdfplumber.open(str(pdf_path)) as pdf:
         for page_detection, page in zip(detection.pages, pdf.pages, strict=False):
+            page = _dedupe_page_chars(page)
             raw_text = page_detection.native_text or page.extract_text() or ""
             normalized_text = normalize_text(raw_text)
             words = _extract_words(page)
@@ -73,6 +74,16 @@ def extract_raw_content(pdf_path: Path, detection: PageDetectionResult) -> RawEx
         pages=pages,
         document_warnings=document_warnings,
     )
+
+
+def _dedupe_page_chars(page: object) -> object:
+    dedupe_chars = getattr(page, "dedupe_chars", None)
+    if not callable(dedupe_chars):
+        return page
+    try:
+        return dedupe_chars(tolerance=1, extra_attrs=("fontname", "size"))
+    except Exception:
+        return page
 
 
 def _extract_vector_primitives(pdf_path: Path) -> tuple[dict[int, list[DrawingPrimitive]], list[str]]:

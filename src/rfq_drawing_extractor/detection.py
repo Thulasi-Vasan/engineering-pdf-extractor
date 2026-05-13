@@ -45,6 +45,7 @@ def detect_pdf_pages(pdf_path: Path) -> PageDetectionResult:
 
     with pdfplumber.open(str(pdf_path)) as pdf:
         for index, page in enumerate(pdf.pages, start=1):
+            page = _dedupe_page_chars(page)
             raw_text = page.extract_text() or ""
             normalized_text = normalize_text(raw_text)
             text_strength = measure_text_strength(normalized_text)
@@ -79,6 +80,16 @@ def detect_pdf_pages(pdf_path: Path) -> PageDetectionResult:
         pages=pages,
         document_warnings=document_warnings,
     )
+
+
+def _dedupe_page_chars(page: object) -> object:
+    dedupe_chars = getattr(page, "dedupe_chars", None)
+    if not callable(dedupe_chars):
+        return page
+    try:
+        return dedupe_chars(tolerance=1, extra_attrs=("fontname", "size"))
+    except Exception:
+        return page
 
 
 def measure_text_strength(text: str) -> TextStrength:
@@ -163,4 +174,3 @@ def classify_document(pages: list[PageDetection]) -> str:
     if image_count and not text_count:
         return "scanned_image_pdf"
     return "text_vector_pdf"
-
