@@ -309,15 +309,110 @@ class StructuredEngineeringData(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class LLMReviewItem(BaseModel):
+    item_type: str = ""
+    value: Any = None
+    confidence: ConfidenceLabel = "review"
+    evidence: str = ""
+    page: int | None = None
+    reason: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
+class LLMFinalDimension(BaseModel):
+    value: Any = None
+    unit: str = ""
+    raw_callout: str = ""
+    label: str = ""
+    description: str = ""
+    view_label: str = ""
+    region_id: str = ""
+    page: int | None = None
+    confidence: ConfidenceLabel = "review"
+    evidence: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
+class LLMFinalThread(BaseModel):
+    thread_size: str = ""
+    pitch: float | None = None
+    threads_per_inch: int | None = None
+    thread_class: str = ""
+    source_type: str = ""
+    label: str = ""
+    region_id: str = ""
+    page: int | None = None
+    confidence: ConfidenceLabel = "review"
+    evidence: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
+class LLMFinalTable(BaseModel):
+    table_type: str = ""
+    table_id: str = ""
+    title: str = ""
+    headers: list[str] = Field(default_factory=list)
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    page: int | None = None
+    confidence: ConfidenceLabel = "review"
+    evidence: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
+class LLMFinalManufacturingRequirement(BaseModel):
+    requirement_type: str = ""
+    value: Any = None
+    label: str = ""
+    region_id: str = ""
+    page: int | None = None
+    confidence: ConfidenceLabel = "review"
+    evidence: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
+class LLMFinalDrawingRegion(BaseModel):
+    region_id: str = ""
+    region_type: str = ""
+    label: str = ""
+    semantic_label: str = ""
+    page: int | None = None
+    confidence: ConfidenceLabel = "review"
+    evidence: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
+class LLMFinalEngineeringData(BaseModel):
+    title_block: dict[str, Any] = Field(default_factory=dict)
+    drawing_type: Any = None
+    units: Any = None
+    dimensions: list[LLMFinalDimension] = Field(default_factory=list)
+    threads: list[LLMFinalThread] = Field(default_factory=list)
+    tables: list[LLMFinalTable] = Field(default_factory=list)
+    manufacturing_requirements: list[LLMFinalManufacturingRequirement] = Field(default_factory=list)
+    drawing_regions: list[LLMFinalDrawingRegion] = Field(default_factory=list)
+    review_items: list[LLMReviewItem] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class LLMFinalizationResult(BaseModel):
+    status: Literal["not_run", "success", "failed"] = "not_run"
+    model: str = ""
+    final_data: LLMFinalEngineeringData = Field(default_factory=LLMFinalEngineeringData)
+    raw_response: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
 class ExtractionRunResult(BaseModel):
     metadata: RunMetadata
     page_detection_path: str
     raw_extraction_path: str
     structured_data_path: str
     report_path: str
+    llm_final_data_path: str | None = None
     page_detection: PageDetectionResult
     raw_extraction: RawExtractionResult
     structured_data: StructuredEngineeringData
+    llm_final_data: LLMFinalizationResult | None = None
 
 
 def write_json(path: Path, payload: BaseModel) -> None:
