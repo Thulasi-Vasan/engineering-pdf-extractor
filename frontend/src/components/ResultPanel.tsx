@@ -19,8 +19,8 @@ import { clsx } from 'clsx';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { atomDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 
-import { api } from '../lib/api';
-import type { ExtractionResponse } from '../lib/api';
+import { api } from '../lib/api.ts';
+import type { ExtractionResponse } from '../lib/api.ts';
 
 interface ResultPanelProps {
   result: ExtractionResponse;

@@ -11,16 +11,16 @@ import {
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
-import { api, BASE_URL } from './lib/api';
-import type { ExtractionResponse } from './lib/api';
-import { storage } from './lib/storage';
-import type { SavedRun } from './lib/storage';
+import { api, BASE_URL } from './lib/api.ts';
+import type { ExtractionResponse } from './lib/api.ts';
+import { storage } from './lib/storage.ts';
+import type { SavedRun } from './lib/storage.ts';
 
 // --- Components ---
-import FileUpload from './components/FileUpload';
-import ExtractionOptions from './components/ExtractionOptions';
-import ResultPanel from './components/ResultPanel';
-import LoadingOverlay from './components/LoadingOverlay';
+import FileUpload from './components/FileUpload.tsx';
+import ExtractionOptions from './components/ExtractionOptions.tsx';
+import ResultPanel from './components/ResultPanel.tsx';
+import LoadingOverlay from './components/LoadingOverlay.tsx';
 
 /**
  * Utility for tailwind class merging
@@ -116,7 +116,7 @@ export default function App() {
           </div>
           <div>
             <h1 className="text-xl">Engineering PDF Extractor</h1>
-            <p className="text-xs text-slate-500 font-medium uppercase tracking-wider">Dashboard v1.0</p>
+            <p className="text-xs text-slate-500 font-medium uppercase tracking-wider">Dashboard</p>
           </div>
         </div>
 
@@ -127,7 +127,7 @@ export default function App() {
               backendOnline === true ? "text-brand-success" : backendOnline === false ? "text-brand-error" : "text-slate-400"
             )} />
             <span className="text-xs font-semibold text-slate-600">
-              Backend: {backendOnline === true ? 'Online' : backendOnline === false ? 'Offline' : 'Checking...'}
+              Server: {backendOnline === true ? 'Online' : backendOnline === false ? 'Offline' : 'Checking...'}
             </span>
           </div>
         </div>
@@ -233,8 +233,8 @@ export default function App() {
                 <div className="p-4 bg-amber-50 border border-amber-100 rounded-lg flex gap-3 animate-in fade-in slide-in-from-top-2 duration-300">
                   <AlertCircle className="w-5 h-5 text-amber-500 shrink-0" />
                   <div>
-                    <h4 className="text-sm font-semibold text-amber-800">Backend Unreachable</h4>
-                    <p className="text-xs text-amber-600 mt-1 leading-relaxed">The extraction might fail if the server at {BASE_URL} is not running.</p>
+                    <h4 className="text-sm font-semibold text-amber-800">Server Unreachable</h4>
+                    <p className="text-xs text-amber-600 mt-1 leading-relaxed">The extraction might fail if the server is not running.</p>
                   </div>
                 </div>
               )}

@@ -1,73 +1,72 @@
-# React + TypeScript + Vite
+# Engineering PDF Extractor Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A professional, engineering-grade dashboard for the Engineering PDF Extraction system. Built with React, TypeScript, Vite, and Tailwind CSS v4.
 
-Currently, two official plugins are available:
+## Features
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- **Dashboard Layout**: Professional dual-pane interface for configuration and result viewing.
+- **Advanced Extraction Options**: Configure LLM and Vision processing with specific model selection.
+- **Real-time Status**: Live server connectivity monitoring and multi-step extraction progress tracking.
+- **Rich Result Viewer**: Syntax-highlighted JSON viewer, artifact browser, and detailed warning logs.
+- **Run History**: Local persistence of recent extraction runs for quick reference.
 
-## React Compiler
+## Tech Stack
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+- **Framework**: React 19 (TypeScript)
+- **Build Tool**: Vite 6
+- **Styling**: Tailwind CSS v4
+- **Icons**: Lucide React
+- **Animations**: Framer Motion
+- **Runtime**: Bun
 
-## Expanding the ESLint configuration
+## Getting Started
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+### Prerequisites
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+- [Bun](https://bun.sh/) installed on your machine.
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+### Installation
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+1. Navigate to the frontend directory:
+   ```bash
+   cd frontend
+   ```
+
+2. Install dependencies:
+   ```bash
+   bun install
+   ```
+
+### Development
+
+Start the development server:
+```bash
+bun run dev
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+The application will be available at `http://localhost:5173`.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+### Production Build
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+Create an optimized production build:
+```bash
+bun run build
 ```
+
+The output will be in the `dist/` directory.
+
+## Linting & Quality
+
+The project uses ESLint with React-specific plugins for high code quality:
+- `eslint-plugin-react-x`
+- `eslint-plugin-react-dom`
+- `typescript-eslint`
+
+Run the linter:
+```bash
+bun run lint
+```
+
+## Backend Integration
+
+The frontend connects to the backend at `http://127.0.0.1:8000` by default. You can modify this in `src/lib/api.ts`.

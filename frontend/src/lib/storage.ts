@@ -2,7 +2,7 @@
  * LocalStorage Utility for Recent Extractions
  */
 
-import type { ExtractionResponse } from './api';
+import type { ExtractionResponse } from './api.ts';
 
 export interface SavedRun {
   id: string;
