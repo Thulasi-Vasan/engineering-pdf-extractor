@@ -11,7 +11,7 @@ import {
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
-import { api, BASE_URL } from './lib/api.ts';
+import { api } from './lib/api.ts';
 import type { ExtractionResponse } from './lib/api.ts';
 import { storage } from './lib/storage.ts';
 import type { SavedRun } from './lib/storage.ts';
@@ -35,7 +35,7 @@ export default function App() {
   const [result, setResult] = useState<ExtractionResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
-  const [history, setHistory] = useState<SavedRun[]>([]);
+  const [history, setHistory] = useState<SavedRun[]>(() => storage.getRuns());
   
   // Extraction Options
   const [options, setOptions] = useState({
@@ -52,8 +52,6 @@ export default function App() {
       setBackendOnline(isOnline);
     };
     checkHealth();
-    setHistory(storage.getRuns());
-
     const interval = setInterval(checkHealth, 30000); // Check every 30s
     return () => clearInterval(interval);
   }, []);
@@ -85,8 +83,9 @@ export default function App() {
       storage.saveRun(savedRun);
       setHistory(storage.getRuns());
 
-    } catch (err: any) {
-      setError(err.message || 'An unexpected error occurred during extraction.');
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'An unexpected error occurred during extraction.';
+      setError(message);
       console.error(err);
     } finally {
       setIsExtracting(false);

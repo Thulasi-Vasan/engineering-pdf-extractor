@@ -9,7 +9,7 @@ interface ExtractionOptionsProps {
     llm_final_model: string;
     vision_model: string;
   };
-  setOptions: (options: any) => void;
+  setOptions: (updater: (prev: ExtractionOptionsProps['options']) => ExtractionOptionsProps['options']) => void;
   disabled?: boolean;
 }
 
@@ -18,12 +18,12 @@ export default function ExtractionOptions({ options, setOptions, disabled }: Ext
 
   const toggleOption = (key: string) => {
     if (disabled) return;
-    setOptions((prev: any) => ({ ...prev, [key]: !prev[key] }));
+    setOptions((prev) => ({ ...prev, [key]: !prev[key as keyof typeof prev] }));
   };
 
   const handleSelectChange = (e: ChangeEvent<HTMLSelectElement>) => {
     const { name, value } = e.target;
-    setOptions((prev: any) => ({ ...prev, [name]: value }));
+    setOptions((prev) => ({ ...prev, [name]: value }));
   };
 
   return (

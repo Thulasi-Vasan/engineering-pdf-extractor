@@ -23,7 +23,7 @@ export interface Artifacts {
 export interface ExtractionResponse {
   run_id: string;
   status: 'success' | 'failed' | 'partial_success';
-  final_json: any;
+  final_json: Record<string, unknown>;
   artifacts: Artifacts;
   warnings: string[];
   error?: string;

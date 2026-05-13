@@ -65,7 +65,7 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
     }
   };
 
-  const artifactIcons: Record<string, any> = {
+  const artifactIcons: Record<string, typeof Map> = {
     page_detection: Map,
     raw_extraction: Eye,
     structured_data: Layers,
@@ -217,8 +217,8 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
               </div>
             ) : (
               <div className="space-y-3">
-                {result.warnings.map((warning, i) => (
-                  <div key={i} className="flex gap-4 p-4 bg-amber-50 border border-amber-100 rounded-xl">
+                {result.warnings.map((warning) => (
+                  <div key={warning} className="flex gap-4 p-4 bg-amber-50 border border-amber-100 rounded-xl">
                     <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
                     <p className="text-sm text-amber-900 leading-relaxed">{warning}</p>
                   </div>
@@ -249,7 +249,16 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
   );
 }
 
-function TabButton({ active, onClick, icon, label, count, variant = 'primary' }: any) {
+interface TabButtonProps {
+  active: boolean;
+  onClick: () => void;
+  icon: React.ReactNode;
+  label: string;
+  count?: number;
+  variant?: 'primary' | 'warning';
+}
+
+function TabButton({ active, onClick, icon, label, count, variant = 'primary' }: TabButtonProps) {
   return (
     <button
       onClick={onClick}
