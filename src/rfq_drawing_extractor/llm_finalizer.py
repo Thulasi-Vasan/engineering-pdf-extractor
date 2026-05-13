@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
+from pydantic import ValidationError
 
 from .models import (
     LLMFinalEngineeringData,
@@ -29,6 +30,7 @@ def finalize_engineering_data_with_llm(
 ) -> LLMFinalizationResult:
     load_dotenv(override=True)
     selected_model = _select_finalizer_model(model)
+    response_text = ""
     try:
         image_bytes = _render_pages_to_png_300_dpi(pdf_path, [page.page_number for page in raw.pages])
         context = _build_finalizer_context(page_detection, raw, structured)
@@ -37,18 +39,24 @@ def finalize_engineering_data_with_llm(
             context=context,
             page_images=image_bytes,
         )
-        final_data = LLMFinalEngineeringData.model_validate(_extract_json_object(response["output_text"]))
+        response_text = response["output_text"]
+        final_data, raw_response, warnings = _parse_finalizer_response_with_repair(
+            model=selected_model,
+            response_text=response_text,
+        )
         _apply_evidence_guardrails(final_data)
         return LLMFinalizationResult(
             status="success",
             model=selected_model,
             final_data=final_data,
-            raw_response=response["output_text"],
+            raw_response=raw_response,
+            warnings=warnings,
         )
     except Exception as exc:
         return LLMFinalizationResult(
             status="failed",
             model=selected_model,
+            raw_response=response_text,
             warnings=[f"LLM final JSON generation failed: {exc}"],
         )
 
@@ -104,30 +112,34 @@ def _call_bedrock_finalizer(
         raise RuntimeError("AWS_REGION or AWS_DEFAULT_REGION is required for Bedrock final JSON generation.")
 
     os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
-    try:
-        import boto3
-        from botocore.config import Config
-    except ImportError as exc:
-        raise RuntimeError("boto3 and botocore are required for Bedrock final JSON generation.") from exc
-
     content: list[dict[str, Any]] = [
         {"text": _finalizer_prompt(context)},
     ]
     for _, image_bytes in sorted(page_images.items()):
         content.append({"image": {"format": "png", "source": {"bytes": image_bytes}}})
 
-    client = boto3.client(
-        "bedrock-runtime",
-        region_name=region,
-        config=Config(connect_timeout=10, read_timeout=90, retries={"max_attempts": 1}),
-    )
+    client = _bedrock_client(region)
     response = client.converse(
         modelId=model,
         system=[{"text": _system_prompt()}],
         messages=[{"role": "user", "content": content}],
-        inferenceConfig={"maxTokens": 7000, "temperature": 0},
+        inferenceConfig={"maxTokens": 10000, "temperature": 0},
     )
     return {"output_text": _bedrock_output_text(response)}
+
+
+def _bedrock_client(region: str) -> Any:
+    try:
+        import boto3
+        from botocore.config import Config
+    except ImportError as exc:
+        raise RuntimeError("boto3 and botocore are required for Bedrock final JSON generation.") from exc
+
+    return boto3.client(
+        "bedrock-runtime",
+        region_name=region,
+        config=Config(connect_timeout=10, read_timeout=300, retries={"max_attempts": 1}),
+    )
 
 
 def _system_prompt() -> str:
@@ -146,6 +158,7 @@ def _finalizer_prompt(context: dict[str, Any]) -> str:
         "consolidate duplicates, and add review items for uncertainty. Do not silently overwrite high-confidence "
         "deterministic values.\n\n"
         "Return only compact valid JSON. Do not include markdown fences.\n\n"
+        "Keep string values concise so the JSON remains valid for large drawings.\n\n"
         "Required JSON shape:\n"
         "{\n"
         '  "title_block": {},\n'
@@ -282,6 +295,54 @@ def _primitive_summary(primitives: list[object]) -> dict[str, Any]:
         primitive_type = str(getattr(primitive, "primitive_type", "unknown_vector") or "unknown_vector")
         counts[primitive_type] = counts.get(primitive_type, 0) + 1
     return {"total": len(primitives), "by_type": counts}
+
+
+def _parse_finalizer_response_with_repair(
+    *,
+    model: str,
+    response_text: str,
+) -> tuple[LLMFinalEngineeringData, str, list[str]]:
+    try:
+        return _parse_final_data(response_text), response_text, []
+    except (json.JSONDecodeError, ValueError, ValidationError) as exc:
+        repaired_text = _call_bedrock_json_repair(
+            model=model,
+            invalid_json=response_text,
+            error=str(exc),
+        )
+        return (
+            _parse_final_data(repaired_text),
+            f"{response_text}\n\n--- JSON REPAIR RESPONSE ---\n{repaired_text}",
+            ["Initial Claude JSON was invalid and was repaired automatically."],
+        )
+
+
+def _parse_final_data(text: str) -> LLMFinalEngineeringData:
+    return LLMFinalEngineeringData.model_validate(_extract_json_object(text))
+
+
+def _call_bedrock_json_repair(*, model: str, invalid_json: str, error: str) -> str:
+    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
+    if not region:
+        raise RuntimeError("AWS_REGION or AWS_DEFAULT_REGION is required for Bedrock JSON repair.")
+
+    prompt = (
+        "Repair the following JSON response so it is valid compact JSON only.\n"
+        "Preserve the same facts and field names. Do not add new facts. Do not explain the repair. "
+        "Do not include markdown fences.\n\n"
+        "The JSON must match this top-level shape:\n"
+        '{"title_block":{},"drawing_type":null,"units":null,"dimensions":[],"threads":[],"tables":[],'
+        '"manufacturing_requirements":[],"drawing_regions":[],"review_items":[],"warnings":[]}\n\n'
+        f"Parser error:\n{_limit_text(error, 2000)}\n\n"
+        f"Invalid JSON response:\n{_limit_text(invalid_json, 60000)}"
+    )
+    response = _bedrock_client(region).converse(
+        modelId=model,
+        system=[{"text": "You repair malformed JSON. Return valid JSON only."}],
+        messages=[{"role": "user", "content": [{"text": prompt}]}],
+        inferenceConfig={"maxTokens": 10000, "temperature": 0},
+    )
+    return _bedrock_output_text(response)
 
 
 def _apply_evidence_guardrails(final_data: LLMFinalEngineeringData) -> None:

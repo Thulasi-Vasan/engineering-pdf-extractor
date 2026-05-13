@@ -77,6 +77,7 @@ def extract_pdf(
         page_detection_path=str(page_detection_path),
         raw_extraction_path=str(raw_extraction_path),
         structured_data_path=str(structured_data_path),
+        final_json_path=llm_final_path_value,
         report_path=str(report_path),
         llm_final_data_path=llm_final_path_value,
         page_detection=page_detection,

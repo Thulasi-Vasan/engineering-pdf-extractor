@@ -407,6 +407,7 @@ class ExtractionRunResult(BaseModel):
     page_detection_path: str
     raw_extraction_path: str
     structured_data_path: str
+    final_json_path: str | None = None
     report_path: str
     llm_final_data_path: str | None = None
     page_detection: PageDetectionResult

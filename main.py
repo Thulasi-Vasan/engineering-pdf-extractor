@@ -31,7 +31,7 @@ def main() -> int:
     parser.add_argument(
         "--llm-final-json",
         action="store_true",
-        help="Use Bedrock to generate a separate experimental final engineering JSON output.",
+        help="Use Bedrock to generate the final downstream engineering JSON output.",
     )
     parser.add_argument(
         "--llm-final-model",
@@ -57,8 +57,8 @@ def main() -> int:
     print(f"Page detection: {result.page_detection_path}")
     print(f"Raw extraction: {result.raw_extraction_path}")
     print(f"Structured data: {result.structured_data_path}")
-    if result.llm_final_data_path:
-        print(f"LLM final data: {result.llm_final_data_path}")
+    if result.final_json_path:
+        print(f"Final downstream JSON: {result.final_json_path}")
     print(f"Report: {result.report_path}")
     return 0
 
