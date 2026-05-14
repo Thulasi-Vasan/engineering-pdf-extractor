@@ -13,7 +13,9 @@ import {
   FileText,
   Layers,
   Map,
+  MessageSquare,
   Search,
+  Send,
   Table2,
 } from 'lucide-react';
 import { clsx } from 'clsx';
@@ -21,14 +23,14 @@ import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { atomDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 
 import { api } from '../lib/api.ts';
-import type { ExtractionResponse } from '../lib/api.ts';
+import type { ChatResponse, ExtractionResponse } from '../lib/api.ts';
 
 interface ResultPanelProps {
   result: ExtractionResponse;
   onReset: () => void;
 }
 
-type Tab = 'summary' | 'final_json' | 'artifacts' | 'warnings';
+type Tab = 'summary' | 'chat' | 'final_json' | 'artifacts' | 'warnings';
 type JsonRecord = Record<string, unknown>;
 type CellTone = 'normal' | 'muted' | 'success' | 'warning' | 'danger';
 
@@ -44,6 +46,10 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
   const [activeTab, setActiveTab] = useState<Tab>('summary');
   const [copied, setCopied] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
+  const [chatQuestion, setChatQuestion] = useState('');
+  const [chatResponse, setChatResponse] = useState<ChatResponse | null>(null);
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatError, setChatError] = useState('');
   const finalJsonPayload = asRecord(result.final_json)?.final_data;
   const displayJson = asRecord(finalJsonPayload) ?? asRecord(result.final_json) ?? {};
   const summary = buildSummary(displayJson, result);
@@ -64,6 +70,21 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+  };
+
+  const handleAskQuestion = async () => {
+    const question = chatQuestion.trim();
+    if (!question || chatLoading) return;
+    setChatLoading(true);
+    setChatError('');
+    try {
+      const response = await api.chat(result.run_id, question);
+      setChatResponse(response);
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : 'Chat request failed');
+    } finally {
+      setChatLoading(false);
+    }
   };
 
   const getStatusBadge = () => {
@@ -126,6 +147,12 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
           label="Summary"
         />
         <TabButton
+          active={activeTab === 'chat'}
+          onClick={() => setActiveTab('chat')}
+          icon={<MessageSquare className="w-4 h-4" />}
+          label="Chat"
+        />
+        <TabButton
           active={activeTab === 'final_json'}
           onClick={() => setActiveTab('final_json')}
           icon={<FileJson className="w-4 h-4" />}
@@ -150,6 +177,17 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
 
       <div className="flex-1 overflow-hidden flex flex-col">
         {activeTab === 'summary' && <SummaryView summary={summary} />}
+
+        {activeTab === 'chat' && (
+          <ChatView
+            question={chatQuestion}
+            setQuestion={setChatQuestion}
+            response={chatResponse}
+            loading={chatLoading}
+            error={chatError}
+            onAsk={handleAskQuestion}
+          />
+        )}
 
         {activeTab === 'final_json' && (
           <div className="flex-1 overflow-hidden flex flex-col">
@@ -476,6 +514,136 @@ function SummaryView({ summary }: { summary: SummaryData }) {
           ])}
           emptyLabel="No review items returned."
         />
+      </div>
+    </div>
+  );
+}
+
+function ChatView({
+  question,
+  setQuestion,
+  response,
+  loading,
+  error,
+  onAsk,
+}: {
+  question: string;
+  setQuestion: (value: string) => void;
+  response: ChatResponse | null;
+  loading: boolean;
+  error: string;
+  onAsk: () => void;
+}) {
+  const examples = [
+    'What material is specified?',
+    'What is the diameter?',
+    'List the threads.',
+    'Are there any review items?',
+    'Which dimensions are duplicates?',
+  ];
+
+  return (
+    <div className="flex-1 overflow-auto bg-slate-50/40 p-5">
+      <div className="max-w-5xl mx-auto space-y-5">
+        <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+          <SectionHeader title="Ask Final JSON" />
+          <div className="p-4 space-y-4">
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={question}
+                onChange={(event) => setQuestion(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') onAsk();
+                }}
+                placeholder="Ask about dimensions, material, threads, warnings, BOM items..."
+                className="flex-1 px-3 py-2 bg-white border border-slate-200 rounded-md text-sm focus:outline-none focus:ring-1 focus:ring-brand-accent"
+              />
+              <button
+                type="button"
+                onClick={onAsk}
+                disabled={loading || !question.trim()}
+                className="btn btn-primary px-4 py-2 text-sm gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Send className="w-4 h-4" />
+                {loading ? 'Asking...' : 'Ask'}
+              </button>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {examples.map((example) => (
+                <button
+                  key={example}
+                  type="button"
+                  onClick={() => setQuestion(example)}
+                  className="px-2.5 py-1 rounded-md border border-slate-200 bg-slate-50 text-xs text-slate-600 hover:border-brand-accent/40 hover:text-brand-accent"
+                >
+                  {example}
+                </button>
+              ))}
+            </div>
+            <p className="text-xs text-slate-400">
+              Answers are generated from the final downstream JSON and cite matched records where available.
+            </p>
+          </div>
+        </section>
+
+        {error && (
+          <div className="flex gap-3 p-4 bg-red-50 border border-red-100 rounded-lg">
+            <AlertTriangle className="w-5 h-5 text-red-500 shrink-0 mt-0.5" />
+            <p className="text-sm text-red-800">{error}</p>
+          </div>
+        )}
+
+        {response && (
+          <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+            <SectionHeader title="Answer" />
+            <div className="p-4 space-y-4">
+              <div>
+                <p className="text-xs font-mono text-slate-400 mb-2">Q: {response.question}</p>
+                <p className="text-sm text-slate-800 leading-relaxed whitespace-pre-wrap">{response.answer}</p>
+              </div>
+
+              {response.needs_clarification && response.clarification_question && (
+                <div className="p-3 bg-amber-50 border border-amber-100 rounded-lg">
+                  <p className="text-sm text-amber-900">{response.clarification_question}</p>
+                </div>
+              )}
+
+              {response.warnings.length > 0 && (
+                <div className="space-y-2">
+                  {response.warnings.map((warning) => (
+                    <p key={warning} className="flex items-start gap-2 text-xs text-amber-700">
+                      <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                      <span>{warning}</span>
+                    </p>
+                  ))}
+                </div>
+              )}
+
+              <DataTable
+                title="Citations"
+                columns={['Section', 'Value', 'Location', 'Confidence', 'Evidence']}
+                rows={response.citations.slice(0, 12).map((citation) => [
+                  cell(citation.section, {
+                    secondary: citation.target_id,
+                  }),
+                  cell(formatValue(citation.value) || citation.label, {
+                    secondary: citation.label,
+                    warnings: citation.warnings,
+                  }),
+                  cell(citation.region_id || '-', {
+                    secondary: citation.page ? `page ${citation.page}` : '',
+                  }),
+                  cell(citation.confidence || '-', {
+                    tone: confidenceTone(citation.confidence),
+                  }),
+                  cell(citation.evidence || '-'),
+                ])}
+                emptyLabel="No citations were returned."
+              />
+            </div>
+          </section>
+        )}
       </div>
     </div>
   );
