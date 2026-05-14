@@ -10,8 +10,13 @@ from dotenv import load_dotenv
 from pydantic import ValidationError
 
 from .models import (
+    LLMEnrichmentResponse,
     LLMFinalDimension,
+    LLMFinalDrawingRegion,
     LLMFinalEngineeringData,
+    LLMFinalManufacturingRequirement,
+    LLMFinalTable,
+    LLMFinalThread,
     LLMFinalizationResult,
     LLMReviewItem,
     PageDetectionResult,
@@ -32,20 +37,31 @@ def finalize_engineering_data_with_llm(
     load_dotenv(override=True)
     selected_model = _select_finalizer_model(model)
     response_text = ""
+    raw_response = ""
+    warnings: list[str] = []
     try:
-        image_bytes = _render_pages_to_png_300_dpi(pdf_path, [page.page_number for page in raw.pages])
-        context = _build_finalizer_context(page_detection, raw, structured)
-        response = _call_bedrock_finalizer(
-            model=selected_model,
-            context=context,
-            page_images=image_bytes,
-        )
-        response_text = response["output_text"]
-        final_data, raw_response, warnings = _parse_finalizer_response_with_repair(
-            model=selected_model,
-            response_text=response_text,
-        )
-        _complete_final_data_from_structured(final_data, structured)
+        final_data = _build_base_final_data(structured)
+        try:
+            image_bytes = _render_pages_to_png_300_dpi(pdf_path, [page.page_number for page in raw.pages])
+            context = _build_finalizer_context(page_detection, raw, structured, final_data)
+            response = _call_bedrock_finalizer(
+                model=selected_model,
+                context=context,
+                page_images=image_bytes,
+            )
+            response_text = response["output_text"]
+            raw_response = response_text
+            enrichment, raw_response, enrichment_warnings = _parse_enrichment_response_with_repair(
+                model=selected_model,
+                response_text=response_text,
+            )
+            warnings.extend(enrichment_warnings)
+            warnings.extend(_merge_enrichment(final_data, enrichment))
+        except Exception as exc:
+            raw_response = response_text
+            warning = f"LLM enrichment failed; final JSON was built from deterministic extraction only: {exc}"
+            warnings.append(warning)
+            final_data.warnings.append(warning)
         _apply_evidence_guardrails(final_data)
         return LLMFinalizationResult(
             status="success",
@@ -146,40 +162,24 @@ def _bedrock_client(region: str) -> Any:
 
 def _system_prompt() -> str:
     return (
-        "You convert deterministic engineering PDF extraction evidence into a form-ready final JSON object. "
-        "The deterministic extraction is the source of truth. Add semantic labels and descriptions only when "
-        "supported by the structured data, raw evidence, or rendered page images. Do not invent missing values. "
-        "Put uncertain, conflicting, visually inferred, or weakly supported values in review_items."
+        "You enrich deterministic engineering PDF extraction records for form-ready display. "
+        "The backend owns the final JSON schema and deterministic facts. Return only semantic enrichment updates "
+        "for known target_id values. Do not rewrite, remove, or change extracted factual values."
     )
 
 
 def _finalizer_prompt(context: dict[str, Any]) -> str:
     return (
-        "Create a final engineering extraction JSON for the attached PDF page images.\n\n"
-        "Use the deterministic extraction as the source of truth. Enrich labels/descriptions for readability, "
-        "consolidate duplicates, and add review items for uncertainty. Do not silently overwrite high-confidence "
-        "deterministic values.\n\n"
+        "Create semantic enrichment updates for the attached PDF page images.\n\n"
+        "The backend has already built the final engineering JSON from deterministic extraction. "
+        "Your job is only to add human-readable labels, descriptions, view labels, semantic labels, warnings, "
+        "and review notes for the provided target_id records.\n\n"
         "Return only compact valid JSON. Do not include markdown fences.\n\n"
         "Keep string values concise so the JSON remains valid for large drawings.\n\n"
         "Required JSON shape:\n"
         "{\n"
-        '  "title_block": {},\n'
-        '  "drawing_type": null,\n'
-        '  "units": null,\n'
-        '  "dimensions": [\n'
-        '    {"value": null, "unit": "", "secondary_value": null, "imperial_value": null, "dimension_type": "", "quantity": null, "angle_value": null, "angle_unit": "", "role": "", "role_confidence": "review", "raw_callout": "", "normalized_callout": "", "label": "", "description": "", "view_label": "", "region_id": "", "source": "", "page": null, "confidence": "review", "evidence": "", "warnings": []}\n'
-        "  ],\n"
-        '  "threads": [\n'
-        '    {"thread_size": "", "pitch": null, "threads_per_inch": null, "thread_class": "", "source_type": "", "label": "", "region_id": "", "page": null, "confidence": "review", "evidence": "", "warnings": []}\n'
-        "  ],\n"
-        '  "tables": [\n'
-        '    {"table_type": "", "table_id": "", "title": "", "headers": [], "rows": [], "page": null, "confidence": "review", "evidence": "", "warnings": []}\n'
-        "  ],\n"
-        '  "manufacturing_requirements": [\n'
-        '    {"requirement_type": "", "value": null, "label": "", "region_id": "", "page": null, "confidence": "review", "evidence": "", "warnings": []}\n'
-        "  ],\n"
-        '  "drawing_regions": [\n'
-        '    {"region_id": "", "region_type": "", "label": "", "semantic_label": "", "page": null, "confidence": "review", "evidence": "", "warnings": []}\n'
+        '  "updates": [\n'
+        '    {"target_id": "dimensions.0", "label": "", "description": "", "view_label": "", "semantic_label": "", "display_value": null, "review_reason": "", "warnings": []}\n'
         "  ],\n"
         '  "review_items": [\n'
         '    {"item_type": "", "value": null, "confidence": "review", "evidence": "", "page": null, "reason": "", "warnings": []}\n'
@@ -187,16 +187,14 @@ def _finalizer_prompt(context: dict[str, Any]) -> str:
         '  "warnings": []\n'
         "}\n\n"
         "Rules:\n"
-        "- For dimensions, preserve every deterministic field from deterministic_summary.dimensions when the field exists.\n"
-        "- Add semantic dimension label, description, and view_label; do not remove raw deterministic fields to make the output shorter.\n"
-        "- Preserve evidence text, page numbers, region_id, confidence, and warnings where available.\n"
-        "- Use review_items for low-confidence, vision-only, unclear, unsupported, or conflicting values.\n"
-        "- Keep dimensions as visible drawing dimensions only; exclude title block numbers, phone numbers, dates, and BOM item numbers.\n"
-        "- Never convert units unless explicitly supported. If the visible drawing says inches, keep unit as inch.\n"
+        "- Only use target_id values from enrichment_targets.\n"
+        "- Do not return the final engineering JSON; return only updates, review_items, and warnings.\n"
+        "- Allowed update fields are target_id, label, description, view_label, semantic_label, display_value, review_reason, and warnings.\n"
+        "- Do not change values, units, raw_callout, page, source, region_id, dimension_type, thread_size, thread_class, confidence, or evidence.\n"
+        "- Use rendered page images only to improve labels, descriptions, view names, and review notes.\n"
+        "- If a label or description is uncertain, keep the wording cautious and add a review_reason or warning.\n"
         "- Do not treat note/callout text like MIN. THREAD, RELIEF ALLOWED, or THREAD T as drawing view names.\n"
-        "- If semantic view naming is uncertain, keep the deterministic region_id and set view_label to a cautious label.\n"
-        "- Keep GD&T/font-decoded symbols in review_items unless deterministic evidence confirms the meaning.\n"
-        "- Keep drawing_regions as region summaries, not CAD geometry.\n\n"
+        "- Put unsupported visual inferences, GD&T uncertainty, conflicts, or suspected overlay/stamp issues in review_items.\n\n"
         "Deterministic context JSON:\n"
         f"{json.dumps(context, ensure_ascii=False, separators=(',', ':'))}"
     )
@@ -206,6 +204,7 @@ def _build_finalizer_context(
     page_detection: PageDetectionResult,
     raw: RawExtractionResult,
     structured: StructuredEngineeringData,
+    final_data: LLMFinalEngineeringData,
 ) -> dict[str, Any]:
     return {
         "page_detection": {
@@ -223,6 +222,7 @@ def _build_finalizer_context(
             ],
             "document_warnings": page_detection.document_warnings,
         },
+        "enrichment_targets": _enrichment_targets(final_data),
         "deterministic_summary": _structured_context(structured),
         "raw_evidence": {
             "pdf_type": raw.pdf_type,
@@ -263,6 +263,223 @@ def _dump_jsonable(value: Any) -> Any:
     return value
 
 
+def _build_base_final_data(structured: StructuredEngineeringData) -> LLMFinalEngineeringData:
+    final_data = LLMFinalEngineeringData(
+        title_block=_dump_jsonable(structured.title_block),
+        drawing_type=_field_value(structured.drawing_type),
+        units=_field_value(structured.units),
+        dimensions=[
+            _dimension_from_structured(dimension)
+            for dimension in _list_of_dicts(_dump_jsonable(structured.dimensions))
+        ],
+        threads=[
+            _thread_from_structured(thread)
+            for thread in _list_of_dicts(_dump_jsonable(structured.thread_requirements))
+        ],
+        tables=[
+            _table_from_structured(table)
+            for table in _list_of_dicts(_dump_jsonable(structured.engineering_tables))
+        ],
+        manufacturing_requirements=_base_manufacturing_requirements(structured),
+        drawing_regions=[
+            _drawing_region_from_structured(region)
+            for region in _list_of_dicts(_dump_jsonable(structured.drawing_regions))
+        ],
+        warnings=list(structured.warnings),
+    )
+    _add_base_review_items(final_data, structured)
+    return final_data
+
+
+def _field_value(field: Any) -> Any:
+    if field is None:
+        return None
+    dumped = _dump_jsonable(field)
+    if isinstance(dumped, dict) and "value" in dumped:
+        return dumped["value"]
+    return dumped
+
+
+def _list_of_dicts(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _thread_from_structured(thread: dict[str, Any]) -> LLMFinalThread:
+    source_type = "direct_callout"
+    if thread.get("source_table"):
+        source_type = "thread_chart"
+    if thread.get("chart_reference") and not thread.get("thread_size"):
+        source_type = "chart_reference"
+    return LLMFinalThread(
+        thread_size=str(thread.get("thread_size") or thread.get("label") or ""),
+        pitch=thread.get("pitch"),
+        threads_per_inch=thread.get("threads_per_inch"),
+        thread_class=str(thread.get("thread_class") or ""),
+        source_type=source_type,
+        label=str(thread.get("label") or ""),
+        region_id=str(thread.get("region_id") or ""),
+        page=thread.get("page"),
+        confidence=thread.get("confidence") or "review",
+        evidence=str(thread.get("evidence") or ""),
+        warnings=list(thread.get("warnings") or []),
+    )
+
+
+def _table_from_structured(table: dict[str, Any]) -> LLMFinalTable:
+    return LLMFinalTable(
+        table_type=str(table.get("table_type") or ""),
+        table_id=str(table.get("table_id") or ""),
+        title=str(table.get("table_type") or table.get("table_id") or ""),
+        headers=list(table.get("headers") or []),
+        rows=list(table.get("rows") or []),
+        page=table.get("page"),
+        confidence=table.get("confidence") or "review",
+        evidence=str(table.get("evidence") or ""),
+        warnings=list(table.get("warnings") or []),
+    )
+
+
+def _base_manufacturing_requirements(
+    structured: StructuredEngineeringData,
+) -> list[LLMFinalManufacturingRequirement]:
+    requirements: list[LLMFinalManufacturingRequirement] = []
+    seen: set[tuple[str, str, int | None]] = set()
+    source_groups = [
+        _list_of_dicts(_dump_jsonable(structured.engineering_requirements)),
+        _list_of_dicts(_dump_jsonable(structured.manufacturing_requirements)),
+        _list_of_dicts(_dump_jsonable(structured.process_requirements)),
+        _list_of_dicts(_dump_jsonable(structured.tolerances_gdnt)),
+    ]
+    for group in source_groups:
+        for requirement in group:
+            if requirement.get("requirement_type") == "thread":
+                continue
+            final_requirement = _requirement_from_structured(requirement)
+            key = (
+                final_requirement.requirement_type,
+                str(final_requirement.evidence or final_requirement.value),
+                final_requirement.page,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            requirements.append(final_requirement)
+    return requirements
+
+
+def _requirement_from_structured(requirement: dict[str, Any]) -> LLMFinalManufacturingRequirement:
+    raw_value = requirement.get("value")
+    requirement_type = str(requirement.get("requirement_type") or _requirement_type_from_value(raw_value))
+    display_value = _requirement_display_value(raw_value, requirement_type)
+    return LLMFinalManufacturingRequirement(
+        requirement_type=requirement_type,
+        value=display_value,
+        label=_label_from_requirement_type(requirement_type),
+        region_id=str(requirement.get("region_id") or _region_for_requirement(requirement_type)),
+        page=requirement.get("page"),
+        confidence=requirement.get("confidence") or "review",
+        evidence=str(requirement.get("evidence") or ""),
+        warnings=list(requirement.get("warnings") or []),
+    )
+
+
+def _requirement_type_from_value(value: Any) -> str:
+    text = _match_text(value)
+    if "surface finish" in text:
+        return "surface_finish"
+    if "material" in text:
+        return "material"
+    if "heat treatment" in text:
+        return "heat_treatment"
+    if text.startswith("finish"):
+        return "finish"
+    if "edge" in text or "burr" in text:
+        return "edge_break"
+    return "requirement"
+
+
+def _requirement_display_value(value: Any, requirement_type: str) -> Any:
+    text = str(value or "")
+    if ":" not in text:
+        return value
+    prefix, suffix = text.split(":", 1)
+    if _match_text(prefix).replace(" ", "_") == requirement_type:
+        return suffix.strip()
+    return value
+
+
+def _region_for_requirement(requirement_type: str) -> str:
+    return ""
+
+
+def _label_from_requirement_type(requirement_type: str) -> str:
+    return requirement_type.replace("_", " ").title()
+
+
+def _drawing_region_from_structured(region: dict[str, Any]) -> LLMFinalDrawingRegion:
+    return LLMFinalDrawingRegion(
+        region_id=str(region.get("region_id") or ""),
+        region_type=str(region.get("region_type") or ""),
+        label=str(region.get("label") or ""),
+        page=region.get("page"),
+        confidence=region.get("confidence") or "review",
+        evidence=str(region.get("evidence") or ""),
+        warnings=list(region.get("warnings") or []),
+    )
+
+
+def _add_base_review_items(final_data: LLMFinalEngineeringData, structured: StructuredEngineeringData) -> None:
+    for dimension in _list_of_dicts(_dump_jsonable(structured.review_dimensions)):
+        final_data.review_items.append(
+            LLMReviewItem(
+                item_type="dimension",
+                value=dimension.get("raw_callout") or dimension.get("value"),
+                confidence=dimension.get("confidence") or "review",
+                evidence=str(dimension.get("evidence") or ""),
+                page=dimension.get("page"),
+                reason="Deterministic parser marked this dimension for review.",
+                warnings=list(dimension.get("warnings") or []),
+            )
+        )
+
+
+def _enrichment_targets(final_data: LLMFinalEngineeringData) -> list[dict[str, Any]]:
+    targets: list[dict[str, Any]] = []
+    for key, value in final_data.title_block.items():
+        targets.append({"target_id": f"title_block.{key}", "record_type": "title_block", "data": value})
+    targets.extend(
+        {"target_id": f"dimensions.{index}", "record_type": "dimension", "data": item.model_dump(mode="json")}
+        for index, item in enumerate(final_data.dimensions)
+    )
+    targets.extend(
+        {"target_id": f"threads.{index}", "record_type": "thread", "data": item.model_dump(mode="json")}
+        for index, item in enumerate(final_data.threads)
+    )
+    targets.extend(
+        {"target_id": f"tables.{index}", "record_type": "table", "data": item.model_dump(mode="json")}
+        for index, item in enumerate(final_data.tables)
+    )
+    targets.extend(
+        {
+            "target_id": f"manufacturing_requirements.{index}",
+            "record_type": "manufacturing_requirement",
+            "data": item.model_dump(mode="json"),
+        }
+        for index, item in enumerate(final_data.manufacturing_requirements)
+    )
+    targets.extend(
+        {
+            "target_id": f"drawing_regions.{index}",
+            "record_type": "drawing_region",
+            "data": item.model_dump(mode="json"),
+        }
+        for index, item in enumerate(final_data.drawing_regions)
+    )
+    return targets
+
+
 def _page_context(page: object) -> dict[str, Any]:
     return {
         "page_number": getattr(page, "page_number", None),
@@ -301,13 +518,13 @@ def _primitive_summary(primitives: list[object]) -> dict[str, Any]:
     return {"total": len(primitives), "by_type": counts}
 
 
-def _parse_finalizer_response_with_repair(
+def _parse_enrichment_response_with_repair(
     *,
     model: str,
     response_text: str,
-) -> tuple[LLMFinalEngineeringData, str, list[str]]:
+) -> tuple[LLMEnrichmentResponse, str, list[str]]:
     try:
-        return _parse_final_data(response_text), response_text, []
+        return _parse_enrichment_data(response_text), response_text, []
     except (json.JSONDecodeError, ValueError, ValidationError) as exc:
         repaired_text = _call_bedrock_json_repair(
             model=model,
@@ -315,14 +532,14 @@ def _parse_finalizer_response_with_repair(
             error=str(exc),
         )
         return (
-            _parse_final_data(repaired_text),
+            _parse_enrichment_data(repaired_text),
             f"{response_text}\n\n--- JSON REPAIR RESPONSE ---\n{repaired_text}",
-            ["Initial Claude JSON was invalid and was repaired automatically."],
+            ["Initial Claude enrichment JSON was invalid and was repaired automatically."],
         )
 
 
-def _parse_final_data(text: str) -> LLMFinalEngineeringData:
-    return LLMFinalEngineeringData.model_validate(_extract_json_object(text))
+def _parse_enrichment_data(text: str) -> LLMEnrichmentResponse:
+    return LLMEnrichmentResponse.model_validate(_extract_json_object(text))
 
 
 def _call_bedrock_json_repair(*, model: str, invalid_json: str, error: str) -> str:
@@ -335,8 +552,7 @@ def _call_bedrock_json_repair(*, model: str, invalid_json: str, error: str) -> s
         "Preserve the same facts and field names. Do not add new facts. Do not explain the repair. "
         "Do not include markdown fences.\n\n"
         "The JSON must match this top-level shape:\n"
-        '{"title_block":{},"drawing_type":null,"units":null,"dimensions":[],"threads":[],"tables":[],'
-        '"manufacturing_requirements":[],"drawing_regions":[],"review_items":[],"warnings":[]}\n\n'
+        '{"updates":[],"review_items":[],"warnings":[]}\n\n'
         f"Parser error:\n{_limit_text(error, 2000)}\n\n"
         f"Invalid JSON response:\n{_limit_text(invalid_json, 60000)}"
     )
@@ -347,6 +563,116 @@ def _call_bedrock_json_repair(*, model: str, invalid_json: str, error: str) -> s
         inferenceConfig={"maxTokens": 10000, "temperature": 0},
     )
     return _bedrock_output_text(response)
+
+
+def _merge_enrichment(
+    final_data: LLMFinalEngineeringData,
+    enrichment: LLMEnrichmentResponse,
+) -> list[str]:
+    warnings: list[str] = []
+    targets = _target_registry(final_data)
+    for update in enrichment.updates:
+        target_id = update.target_id.strip()
+        target = targets.get(target_id)
+        if target is None:
+            warning = f"Ignored LLM enrichment update for unknown target_id: {target_id}"
+            warnings.append(warning)
+            final_data.review_items.append(
+                LLMReviewItem(
+                    item_type="llm_enrichment",
+                    value=target_id,
+                    confidence="review",
+                    reason="Claude returned an enrichment update for a target_id that does not exist.",
+                    warnings=[warning],
+                )
+            )
+            continue
+        _apply_semantic_update(target_id, target, update, final_data)
+
+    for review_item in enrichment.review_items:
+        review_item.confidence = "review"
+        review_item.reason = _clip_text(review_item.reason, 300)
+        review_item.warnings = [_clip_text(warning, 300) for warning in review_item.warnings]
+        final_data.review_items.append(review_item)
+
+    for warning in enrichment.warnings:
+        final_data.warnings.append(_clip_text(warning, 300))
+
+    return warnings
+
+
+def _target_registry(final_data: LLMFinalEngineeringData) -> dict[str, Any]:
+    targets: dict[str, Any] = {}
+    for key, value in final_data.title_block.items():
+        targets[f"title_block.{key}"] = value
+    targets.update({f"dimensions.{index}": item for index, item in enumerate(final_data.dimensions)})
+    targets.update({f"threads.{index}": item for index, item in enumerate(final_data.threads)})
+    targets.update({f"tables.{index}": item for index, item in enumerate(final_data.tables)})
+    targets.update(
+        {
+            f"manufacturing_requirements.{index}": item
+            for index, item in enumerate(final_data.manufacturing_requirements)
+        }
+    )
+    targets.update({f"drawing_regions.{index}": item for index, item in enumerate(final_data.drawing_regions)})
+    return targets
+
+
+def _apply_semantic_update(
+    target_id: str,
+    target: Any,
+    update: Any,
+    final_data: LLMFinalEngineeringData,
+) -> None:
+    if isinstance(target, dict):
+        _apply_dict_semantic_update(target, update)
+    else:
+        _apply_model_semantic_update(target, update)
+
+    if update.review_reason:
+        final_data.review_items.append(
+            LLMReviewItem(
+                item_type="llm_enrichment",
+                value=target_id,
+                confidence="review",
+                evidence=str(getattr(target, "evidence", "") if not isinstance(target, dict) else target.get("evidence", "")),
+                page=getattr(target, "page", None) if not isinstance(target, dict) else target.get("page"),
+                reason=_clip_text(update.review_reason, 300),
+                warnings=[_clip_text(warning, 300) for warning in update.warnings],
+            )
+        )
+
+
+def _apply_dict_semantic_update(target: dict[str, Any], update: Any) -> None:
+    if update.label:
+        target["label"] = _clip_text(update.label, 80)
+    if update.description:
+        target["description"] = _clip_text(update.description, 300)
+    if update.display_value is not None:
+        target["display_value"] = update.display_value
+    if update.warnings:
+        target["warnings"] = _merge_warnings(
+            target.get("warnings", []),
+            [_clip_text(warning, 300) for warning in update.warnings],
+        )
+
+
+def _apply_model_semantic_update(target: Any, update: Any) -> None:
+    if update.label and hasattr(target, "label"):
+        target.label = _clip_text(update.label, 80)
+    if update.description and hasattr(target, "description"):
+        target.description = _clip_text(update.description, 300)
+    if update.view_label and hasattr(target, "view_label"):
+        target.view_label = _clip_text(update.view_label, 80)
+    if update.semantic_label and hasattr(target, "semantic_label"):
+        target.semantic_label = _clip_text(update.semantic_label, 160)
+    if update.display_value is not None and hasattr(target, "display_value"):
+        target.display_value = update.display_value
+    if update.warnings and hasattr(target, "warnings"):
+        target.warnings = _merge_warnings(
+            target.warnings,
+            [_clip_text(warning, 300) for warning in update.warnings],
+        )
 
 
 def _complete_final_data_from_structured(
@@ -544,6 +870,10 @@ def _require_evidence(records: list[object], item_type: str, final_data: LLMFina
 def _limit_text(value: str, limit: int) -> str:
     compact = re.sub(r"\s+", " ", value).strip()
     return compact if len(compact) <= limit else compact[: limit - 3].rstrip() + "..."
+
+
+def _clip_text(value: Any, limit: int) -> str:
+    return _limit_text(str(value or ""), limit)
 
 
 def _bedrock_output_text(response: dict[str, Any]) -> str:
