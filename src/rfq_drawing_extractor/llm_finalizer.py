@@ -192,9 +192,11 @@ def _finalizer_prompt(context: dict[str, Any]) -> str:
         "- Allowed update fields are target_id, label, description, view_label, semantic_label, display_value, review_reason, and warnings.\n"
         "- Do not change values, units, raw_callout, page, source, region_id, dimension_type, thread_size, thread_class, confidence, or evidence.\n"
         "- Use rendered page images only to improve labels, descriptions, view names, and review notes.\n"
-        "- If a label or description is uncertain, keep the wording cautious and add a review_reason or warning.\n"
+        "- Keep descriptions cautious; do not invent design intent, manufacturing purpose, or feature function beyond the visible evidence.\n"
+        "- If a label or description is mildly uncertain, put that note in the update warnings field only.\n"
+        "- Use review_reason only for real downstream risks, not routine low-confidence semantic labels.\n"
         "- Do not treat note/callout text like MIN. THREAD, RELIEF ALLOWED, or THREAD T as drawing view names.\n"
-        "- Put unsupported visual inferences, GD&T uncertainty, conflicts, or suspected overlay/stamp issues in review_items.\n\n"
+        "- Put only unsupported factual claims, GD&T uncertainty, conflicts, suspected overlay/stamp issues, or unknown target problems in review_items.\n\n"
         "Deterministic context JSON:\n"
         f"{json.dumps(context, ensure_ascii=False, separators=(',', ':'))}"
     )
@@ -345,7 +347,8 @@ def _base_manufacturing_requirements(
     structured: StructuredEngineeringData,
 ) -> list[LLMFinalManufacturingRequirement]:
     requirements: list[LLMFinalManufacturingRequirement] = []
-    seen: set[tuple[str, str, int | None]] = set()
+    seen: set[tuple[str, str, str, int | None]] = set()
+    omitted_process_duplicates: list[str] = []
     source_groups = [
         _list_of_dicts(_dump_jsonable(structured.engineering_requirements)),
         _list_of_dicts(_dump_jsonable(structured.manufacturing_requirements)),
@@ -358,14 +361,24 @@ def _base_manufacturing_requirements(
                 continue
             final_requirement = _requirement_from_structured(requirement)
             key = (
-                final_requirement.requirement_type,
-                str(final_requirement.evidence or final_requirement.value),
+                _requirement_dedupe_type(final_requirement),
+                _normalize_requirement_text(final_requirement.value),
+                _normalize_requirement_text(final_requirement.evidence),
                 final_requirement.page,
             )
             if key in seen:
                 continue
+            if _is_process_duplicate(final_requirement, requirements):
+                omitted_process_duplicates.append(str(final_requirement.evidence or final_requirement.value))
+                continue
             seen.add(key)
             requirements.append(final_requirement)
+    if omitted_process_duplicates:
+        _append_unique_warning(
+            requirements,
+            "Duplicate heat treatment / finish process placeholder omitted from final requirements.",
+            {"heat_treatment", "finish"},
+        )
     return requirements
 
 
@@ -383,6 +396,62 @@ def _requirement_from_structured(requirement: dict[str, Any]) -> LLMFinalManufac
         evidence=str(requirement.get("evidence") or ""),
         warnings=list(requirement.get("warnings") or []),
     )
+
+
+def _requirement_dedupe_type(requirement: LLMFinalManufacturingRequirement) -> str:
+    if requirement.requirement_type in {"process", "heat_treatment", "finish"} and _is_not_specified_value(
+        requirement.value
+    ):
+        return "heat_treatment_finish_unspecified"
+    if _is_gdt_requirement(requirement):
+        return f"gdt:{_normalize_requirement_text(requirement.evidence)}"
+    return requirement.requirement_type
+
+
+def _normalize_requirement_text(value: Any) -> str:
+    text = _match_text(value)
+    text = text.replace("`", "±")
+    text = text.replace("~", "°")
+    text = re.sub(r"[^a-z0-9.#±°+-]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_process_duplicate(
+    requirement: LLMFinalManufacturingRequirement,
+    existing: list[LLMFinalManufacturingRequirement],
+) -> bool:
+    if requirement.requirement_type not in {"process", "heat_treatment", "finish"}:
+        return False
+    if not _is_not_specified_value(requirement.value):
+        return False
+    existing_types = {
+        item.requirement_type
+        for item in existing
+        if item.requirement_type in {"heat_treatment", "finish"} and _is_not_specified_value(item.value)
+    }
+    return bool(existing_types)
+
+
+def _is_not_specified_value(value: Any) -> bool:
+    text = _match_text(value)
+    return "not specified" in text or text in {"", "none", "n/a"}
+
+
+def _is_gdt_requirement(requirement: LLMFinalManufacturingRequirement) -> bool:
+    text = _match_text(requirement.value)
+    evidence = _match_text(requirement.evidence)
+    return "feature control frame" in text or "gdt" in text or evidence in {"c.002", "bn.002b", "j.002a", ".002"}
+
+
+def _append_unique_warning(
+    requirements: list[LLMFinalManufacturingRequirement],
+    warning: str,
+    preferred_types: set[str],
+) -> None:
+    for requirement in requirements:
+        if requirement.requirement_type in preferred_types:
+            requirement.warnings = _merge_warnings(requirement.warnings, [warning])
+            return
 
 
 def _requirement_type_from_value(value: Any) -> str:
@@ -590,6 +659,11 @@ def _merge_enrichment(
         _apply_semantic_update(target_id, target, update, final_data)
 
     for review_item in enrichment.review_items:
+        if not _is_high_value_review_item(review_item):
+            target = targets.get(str(review_item.value or ""))
+            if target is not None:
+                _add_warning_to_target(target, review_item.reason, review_item.warnings)
+            continue
         review_item.confidence = "review"
         review_item.reason = _clip_text(review_item.reason, 300)
         review_item.warnings = [_clip_text(warning, 300) for warning in review_item.warnings]
@@ -599,6 +673,50 @@ def _merge_enrichment(
         final_data.warnings.append(_clip_text(warning, 300))
 
     return warnings
+
+
+def _is_high_value_review_item(review_item: LLMReviewItem) -> bool:
+    text = _match_text(
+        " ".join(
+            [
+                review_item.item_type,
+                str(review_item.value or ""),
+                review_item.reason,
+                " ".join(review_item.warnings),
+            ]
+        )
+    )
+    high_value_terms = [
+        "gdt",
+        "gd&t",
+        "feature control",
+        "font artifact",
+        "unknown target",
+        "does not exist",
+        "unsupported",
+        "conflict",
+        "overwrite",
+        "overlay",
+        "stamp",
+        "distributor",
+        "obscure",
+        "not part of the original",
+    ]
+    if any(term in text for term in high_value_terms):
+        return True
+    if _match_text(review_item.item_type) not in {"llm_enrichment", "dimension_role", "part_name_confidence"}:
+        return True
+    return False
+
+
+def _add_warning_to_target(target: Any, reason: str, warnings: list[str]) -> None:
+    merged_warnings = [_clip_text(item, 300) for item in [reason, *warnings] if str(item or "").strip()]
+    if not merged_warnings:
+        return
+    if isinstance(target, dict):
+        target["warnings"] = _merge_warnings(target.get("warnings", []), merged_warnings)
+    elif hasattr(target, "warnings"):
+        target.warnings = _merge_warnings(target.warnings, merged_warnings)
 
 
 def _target_registry(final_data: LLMFinalEngineeringData) -> dict[str, Any]:
