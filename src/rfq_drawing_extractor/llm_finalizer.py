@@ -29,6 +29,21 @@ from .models import (
 from .vision_dimensions import DEFAULT_BEDROCK_VISION_MODEL
 
 
+MAX_ENRICHMENT_TARGETS = 110
+SECTION_ENRICHMENT_LIMITS = {
+    "dimensions": 35,
+    "threads": 25,
+    "bom_items": 45,
+    "tables": 10,
+    "standards": 10,
+    "engineering_requirements": 25,
+    "manufacturing_requirements": 25,
+    "notes": 8,
+    "connections": 25,
+    "drawing_regions": 12,
+}
+
+
 def finalize_engineering_data_with_llm(
     pdf_path: Path,
     page_detection: PageDetectionResult,
@@ -616,62 +631,150 @@ def _add_base_review_items(final_data: LLMFinalEngineeringData, structured: Stru
 
 def _enrichment_targets(final_data: LLMFinalEngineeringData) -> list[dict[str, Any]]:
     targets: list[dict[str, Any]] = []
+    skipped_by_section: dict[str, int] = {}
     for key, value in final_data.title_block.items():
         targets.append({"target_id": f"title_block.{key}", "record_type": "title_block", "data": value})
-    targets.extend(
-        {"target_id": f"dimensions.{index}", "record_type": "dimension", "data": item.model_dump(mode="json")}
-        for index, item in enumerate(final_data.dimensions)
+    _append_section_targets(targets, skipped_by_section, "dimensions", "dimension", final_data.dimensions)
+    _append_section_targets(targets, skipped_by_section, "threads", "thread", final_data.threads)
+    _append_section_targets(targets, skipped_by_section, "bom_items", "bom_item", final_data.bom_items)
+    _append_section_targets(targets, skipped_by_section, "tables", "table", final_data.tables)
+    _append_section_targets(targets, skipped_by_section, "standards", "standard", final_data.standards)
+    _append_section_targets(
+        targets,
+        skipped_by_section,
+        "engineering_requirements",
+        "engineering_requirement",
+        final_data.engineering_requirements,
     )
-    targets.extend(
-        {"target_id": f"threads.{index}", "record_type": "thread", "data": item.model_dump(mode="json")}
-        for index, item in enumerate(final_data.threads)
+    _append_section_targets(
+        targets,
+        skipped_by_section,
+        "manufacturing_requirements",
+        "manufacturing_requirement",
+        final_data.manufacturing_requirements,
     )
-    targets.extend(
-        {"target_id": f"bom_items.{index}", "record_type": "bom_item", "data": item.model_dump(mode="json")}
-        for index, item in enumerate(final_data.bom_items)
-    )
-    targets.extend(
-        {"target_id": f"tables.{index}", "record_type": "table", "data": item.model_dump(mode="json")}
-        for index, item in enumerate(final_data.tables)
-    )
-    targets.extend(
-        {"target_id": f"standards.{index}", "record_type": "standard", "data": item.model_dump(mode="json")}
-        for index, item in enumerate(final_data.standards)
-    )
-    targets.extend(
-        {
-            "target_id": f"engineering_requirements.{index}",
-            "record_type": "engineering_requirement",
-            "data": item.model_dump(mode="json"),
-        }
-        for index, item in enumerate(final_data.engineering_requirements)
-    )
-    targets.extend(
-        {
-            "target_id": f"manufacturing_requirements.{index}",
-            "record_type": "manufacturing_requirement",
-            "data": item.model_dump(mode="json"),
-        }
-        for index, item in enumerate(final_data.manufacturing_requirements)
-    )
-    targets.extend(
-        {"target_id": f"notes.{index}", "record_type": "note", "data": item.model_dump(mode="json")}
-        for index, item in enumerate(final_data.notes)
-    )
-    targets.extend(
-        {"target_id": f"connections.{index}", "record_type": "connection", "data": item.model_dump(mode="json")}
-        for index, item in enumerate(final_data.connections)
-    )
-    targets.extend(
-        {
-            "target_id": f"drawing_regions.{index}",
-            "record_type": "drawing_region",
-            "data": item.model_dump(mode="json"),
-        }
-        for index, item in enumerate(final_data.drawing_regions)
-    )
+    _append_note_targets(targets, skipped_by_section, final_data.notes)
+    _append_section_targets(targets, skipped_by_section, "connections", "connection", final_data.connections)
+    _append_section_targets(targets, skipped_by_section, "drawing_regions", "drawing_region", final_data.drawing_regions)
     targets.extend(_overall_envelope_targets(final_data.overall_envelope))
+    targets = _apply_total_target_budget(targets, skipped_by_section)
+    _record_skipped_target_warnings(final_data, skipped_by_section)
     return targets
+
+
+def _append_section_targets(
+    targets: list[dict[str, Any]],
+    skipped_by_section: dict[str, int],
+    section: str,
+    record_type: str,
+    records: list[Any],
+) -> None:
+    limit = SECTION_ENRICHMENT_LIMITS.get(section, len(records))
+    for index, item in enumerate(records):
+        if index >= limit:
+            skipped_by_section[section] = skipped_by_section.get(section, 0) + 1
+            continue
+        targets.append(
+            {
+                "target_id": f"{section}.{index}",
+                "record_type": record_type,
+                "data": item.model_dump(mode="json"),
+            }
+        )
+
+
+def _append_note_targets(
+    targets: list[dict[str, Any]],
+    skipped_by_section: dict[str, int],
+    notes: list[LLMFinalField],
+) -> None:
+    limit = SECTION_ENRICHMENT_LIMITS["notes"]
+    included = 0
+    for index, note in enumerate(notes):
+        if not _is_standalone_note_for_enrichment(note):
+            skipped_by_section["notes"] = skipped_by_section.get("notes", 0) + 1
+            continue
+        if included >= limit:
+            skipped_by_section["notes"] = skipped_by_section.get("notes", 0) + 1
+            continue
+        included += 1
+        targets.append(
+            {
+                "target_id": f"notes.{index}",
+                "record_type": "note",
+                "data": note.model_dump(mode="json"),
+            }
+        )
+
+
+def _is_standalone_note_for_enrichment(note: LLMFinalField) -> bool:
+    text = _match_text(" ".join([str(note.value or ""), note.evidence, note.label, note.description]))
+    if len(text) < 8 or text in {"option", "standard", "service valve"}:
+        return False
+    high_value_terms = [
+        "application",
+        "standard notes",
+        "unless otherwise",
+        "legal note",
+        "drawing use",
+        "disclosure",
+        "restriction",
+    ]
+    if any(term in text for term in high_value_terms) and not _looks_like_bom_or_dimension_fragment(text):
+        return True
+    return False
+
+
+def _looks_like_bom_or_dimension_fragment(text: str) -> bool:
+    if re.search(r"\b\d+\s+[a-z][a-z0-9/\"() .-]+?\b\d+\s+[a-z]", text):
+        return True
+    bom_terms = [
+        "angle valve",
+        "discharge flange",
+        "solenoid valve",
+        "liquid injection",
+        "capillary",
+        "checkvalve",
+        "check valve",
+        "oil drain",
+        "oil level",
+        "oil connector",
+        "oil sight glass",
+        "safety valve",
+        "service flange",
+        "service valve",
+        "cable box",
+        "flare",
+        "npt",
+    ]
+    term_count = sum(1 for term in bom_terms if term in text)
+    number_count = len(re.findall(r"\b\d+(?:\.\d+)?\b", text))
+    return term_count >= 2 or (term_count >= 1 and number_count >= 3)
+
+
+def _apply_total_target_budget(
+    targets: list[dict[str, Any]],
+    skipped_by_section: dict[str, int],
+) -> list[dict[str, Any]]:
+    if len(targets) <= MAX_ENRICHMENT_TARGETS:
+        return targets
+    kept = targets[:MAX_ENRICHMENT_TARGETS]
+    for target in targets[MAX_ENRICHMENT_TARGETS:]:
+        section = str(target.get("target_id", "")).split(".", 1)[0] or "unknown"
+        skipped_by_section[section] = skipped_by_section.get(section, 0) + 1
+    return kept
+
+
+def _record_skipped_target_warnings(
+    final_data: LLMFinalEngineeringData,
+    skipped_by_section: dict[str, int],
+) -> None:
+    for section, count in sorted(skipped_by_section.items()):
+        if count <= 0:
+            continue
+        final_data.warnings.append(
+            f"Skipped {count} {section} target{'s' if count != 1 else ''} from Claude enrichment to reduce JSON size."
+        )
 
 
 def _overall_envelope_targets(overall_envelope: dict[str, Any]) -> list[dict[str, Any]]:
