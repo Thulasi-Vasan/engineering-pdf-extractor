@@ -30,6 +30,15 @@ interface ResultPanelProps {
 
 type Tab = 'summary' | 'final_json' | 'artifacts' | 'warnings';
 type JsonRecord = Record<string, unknown>;
+type CellTone = 'normal' | 'muted' | 'success' | 'warning' | 'danger';
+
+interface TableCellData {
+  primary: string;
+  secondary?: string;
+  meta?: string;
+  tone?: CellTone;
+  warnings?: string[];
+}
 
 export default function ResultPanel({ result, onReset }: ResultPanelProps) {
   const [activeTab, setActiveTab] = useState<Tab>('summary');
@@ -134,7 +143,7 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
           onClick={() => setActiveTab('warnings')}
           icon={<AlertTriangle className="w-4 h-4" />}
           label="Warnings"
-          count={result.warnings.length}
+          count={summary.warningCount}
           variant="warning"
         />
       </div>
@@ -207,7 +216,7 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
 
         {activeTab === 'warnings' && (
           <div className="p-5 space-y-4 overflow-auto">
-            {result.warnings.length === 0 ? (
+            {summary.warningCount === 0 ? (
               <div className="flex flex-col items-center justify-center py-12 text-center">
                 <div className="w-14 h-14 bg-emerald-50 rounded-lg flex items-center justify-center mb-4">
                   <Check className="w-7 h-7 text-emerald-500" />
@@ -217,10 +226,23 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
               </div>
             ) : (
               <div className="space-y-3">
-                {result.warnings.map((warning) => (
+                {summary.finalWarnings.map((warning) => (
                   <div key={warning} className="flex gap-4 p-4 bg-amber-50 border border-amber-100 rounded-lg">
                     <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
                     <p className="text-sm text-amber-900 leading-relaxed">{warning}</p>
+                  </div>
+                ))}
+                {summary.reviewItems.map((item) => (
+                  <div key={reviewItemKey(item)} className="flex gap-4 p-4 bg-slate-50 border border-slate-200 rounded-lg">
+                    <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
+                    <div>
+                      <p className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                        {stringField(item, 'item_type') || 'Review Item'}
+                      </p>
+                      <p className="text-sm text-slate-800 leading-relaxed mt-1">
+                        {stringField(item, 'reason') || stringField(item, 'warning') || stringField(item, 'description') || formatValue(item.value)}
+                      </p>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -242,38 +264,63 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
 function SummaryView({ summary }: { summary: SummaryData }) {
   return (
     <div className="flex-1 overflow-auto bg-slate-50/40 p-5 space-y-5">
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
         <Metric label="Dimensions" value={summary.dimensions.length} />
         <Metric label="Threads" value={summary.threads.length} />
+        <Metric label="GD&T" value={summary.gdtItems.length} tone={summary.gdtItems.length ? 'warning' : 'normal'} />
         <Metric label="Requirements" value={summary.requirements.length} />
         <Metric label="Review Items" value={summary.reviewItems.length} tone={summary.reviewItems.length ? 'warning' : 'normal'} />
       </div>
 
       <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
         <SectionHeader title="Title Block" />
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 divide-y md:divide-y-0 md:divide-x divide-slate-100">
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3">
           {summary.titleFields.length === 0 ? (
             <EmptyState label="No title block fields were returned." />
           ) : (
-            summary.titleFields.slice(0, 12).map(([key, value]) => (
-              <div key={key} className="p-3">
-                <p className="text-[10px] uppercase tracking-wider text-slate-400 font-bold">{formatLabel(key)}</p>
-                <p className="text-sm text-slate-800 mt-1 break-words">{formatValue(value)}</p>
-              </div>
-            ))
+            summary.titleFields.slice(0, 12).map(([key, value]) => {
+              const field = normalizeField(value, key);
+              return (
+                <div key={key} className="p-3 border-b border-r border-slate-100 min-h-[116px]">
+                  <div className="flex items-start justify-between gap-3">
+                    <p className="text-[10px] uppercase tracking-wider text-slate-400 font-bold">{field.label || formatLabel(key)}</p>
+                    <ConfidenceBadge value={field.confidence} />
+                  </div>
+                  <p className="text-sm font-semibold text-slate-800 mt-1 break-words">{field.displayValue || '-'}</p>
+                  {field.description && <p className="text-xs text-slate-500 mt-1.5 leading-relaxed">{field.description}</p>}
+                  <FieldMeta page={field.page} warnings={field.warnings} />
+                </div>
+              );
+            })
           )}
         </div>
       </section>
 
       <DataTable
         title="Dimensions"
-        columns={['Value', 'Label', 'View', 'Confidence', 'Evidence']}
+        columns={['Callout', 'Meaning', 'View / Region', 'Confidence', 'Evidence']}
         rows={summary.dimensions.slice(0, 18).map((item) => [
-          compactDimension(item),
-          stringField(item, 'label'),
-          stringField(item, 'view_label'),
-          stringField(item, 'confidence'),
-          stringField(item, 'evidence') || stringField(item, 'raw_callout'),
+          cell(compactDimension(item), {
+            secondary: dimensionMeta(item),
+            meta: stringField(item, 'normalized_callout') && stringField(item, 'normalized_callout') !== compactDimension(item)
+              ? `normalized: ${stringField(item, 'normalized_callout')}`
+              : '',
+          }),
+          cell(stringField(item, 'label') || formatLabel(stringField(item, 'dimension_type') || stringField(item, 'role') || 'dimension'), {
+            secondary: stringField(item, 'description'),
+            warnings: warningList(item),
+          }),
+          cell(stringField(item, 'view_label') || stringField(item, 'region_id'), {
+            secondary: stringField(item, 'region_id'),
+            meta: stringField(item, 'page') ? `page ${stringField(item, 'page')}` : '',
+          }),
+          cell(stringField(item, 'confidence') || '-', {
+            secondary: stringField(item, 'role_confidence') ? `role: ${stringField(item, 'role_confidence')}` : '',
+            tone: confidenceTone(stringField(item, 'confidence')),
+          }),
+          cell(stringField(item, 'evidence') || compactDimension(item), {
+            secondary: [stringField(item, 'source'), stringField(item, 'page') ? `page ${stringField(item, 'page')}` : ''].filter(Boolean).join(' · '),
+          }),
         ])}
         emptyLabel="No dimensions returned."
       />
@@ -281,25 +328,90 @@ function SummaryView({ summary }: { summary: SummaryData }) {
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
         <DataTable
           title="Threads"
-          columns={['Thread', 'Class', 'Source', 'Evidence']}
+          columns={['Thread', 'Meaning', 'Source / Class', 'Evidence']}
           rows={summary.threads.slice(0, 12).map((item) => [
-            threadLabel(item),
-            stringField(item, 'thread_class'),
-            stringField(item, 'source_type'),
-            stringField(item, 'evidence'),
+            cell(stringField(item, 'display_value') || threadLabel(item), {
+              secondary: stringField(item, 'thread_designation') || stringField(item, 'thread_size'),
+            }),
+            cell(stringField(item, 'label') || 'Thread requirement', {
+              secondary: stringField(item, 'description'),
+              warnings: warningList(item),
+            }),
+            cell(stringField(item, 'source_type') || stringField(item, 'source'), {
+              secondary: stringField(item, 'thread_class') ? `class ${stringField(item, 'thread_class')}` : '',
+            }),
+            cell(stringField(item, 'evidence') || stringField(item, 'raw_text') || '-'),
           ])}
           emptyLabel="No thread requirements returned."
         />
 
         <DataTable
-          title="Manufacturing Requirements"
-          columns={['Type', 'Value', 'Confidence']}
-          rows={summary.requirements.slice(0, 12).map((item) => [
-            stringField(item, 'requirement_type') || stringField(item, 'label'),
-            formatValue(item.value),
-            stringField(item, 'confidence'),
+          title="GD&T / Feature Control Frames"
+          columns={['Control', 'Value', 'View / Region', 'Confidence', 'Review Notes']}
+          rows={summary.gdtItems.slice(0, 12).map((item) => [
+            cell(stringField(item, 'label') || formatLabel(stringField(item, 'requirement_type') || 'GD&T control'), {
+              secondary: stringField(item, 'description'),
+              warnings: warningList(item),
+            }),
+            cell(stringField(item, 'display_value') || formatValue(item.value), {
+              secondary: stringField(item, 'evidence'),
+            }),
+            cell(stringField(item, 'view_label') || stringField(item, 'region_id'), {
+              secondary: stringField(item, 'region_id'),
+              meta: stringField(item, 'page') ? `page ${stringField(item, 'page')}` : '',
+            }),
+            cell(stringField(item, 'confidence') || 'review', {
+              tone: confidenceTone(stringField(item, 'confidence') || 'review'),
+            }),
+            cell(stringField(item, 'review_reason') || stringField(item, 'reason') || '-', {
+              secondary: warningList(item).join(' · '),
+            }),
           ])}
-          emptyLabel="No manufacturing requirements returned."
+          emptyLabel="No GD&T controls returned."
+        />
+      </div>
+
+      <DataTable
+        title="Manufacturing Requirements"
+        columns={['Requirement', 'Value', 'Confidence', 'Evidence / Notes']}
+        rows={summary.requirements.slice(0, 12).map((item) => [
+          cell(stringField(item, 'label') || formatLabel(stringField(item, 'requirement_type') || 'requirement'), {
+            secondary: stringField(item, 'description'),
+            warnings: warningList(item),
+          }),
+          cell(stringField(item, 'display_value') || formatValue(item.value)),
+          cell(stringField(item, 'confidence') || '-', {
+            tone: confidenceTone(stringField(item, 'confidence')),
+          }),
+          cell(stringField(item, 'evidence') || stringField(item, 'raw_text') || '-', {
+            secondary: [stringField(item, 'source'), stringField(item, 'page') ? `page ${stringField(item, 'page')}` : ''].filter(Boolean).join(' · '),
+          }),
+        ])}
+        emptyLabel="No manufacturing requirements returned."
+      />
+
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
+        <DataTable
+          title="Drawing Regions"
+          columns={['Region', 'Label', 'Description', 'Confidence']}
+          rows={summary.drawingRegions.slice(0, 10).map((item) => [
+            cell(stringField(item, 'region_id') || stringField(item, 'region_type')),
+            cell(stringField(item, 'semantic_label') || stringField(item, 'label')),
+            cell(stringField(item, 'description')),
+            cell(stringField(item, 'confidence') || '-', { tone: confidenceTone(stringField(item, 'confidence')) }),
+          ])}
+          emptyLabel="No drawing regions returned."
+        />
+
+        <DataTable
+          title="Review Items"
+          columns={['Type', 'Value', 'Reason']}
+          rows={summary.reviewItems.slice(0, 10).map((item) => [
+            cell(stringField(item, 'item_type') || 'warning', { tone: 'warning' }),
+            cell(formatValue(item.value) || stringField(item, 'evidence') || '-'),
+            cell(stringField(item, 'reason') || stringField(item, 'warning') || stringField(item, 'description')),
+          ])}
+          emptyLabel="No review items returned."
         />
       </div>
     </div>
@@ -323,7 +435,7 @@ function SectionHeader({ title }: { title: string }) {
   );
 }
 
-function DataTable({ title, columns, rows, emptyLabel }: { title: string; columns: string[]; rows: string[][]; emptyLabel: string }) {
+function DataTable({ title, columns, rows, emptyLabel }: { title: string; columns: string[]; rows: TableCellData[][]; emptyLabel: string }) {
   return (
     <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
       <SectionHeader title={title} />
@@ -341,10 +453,10 @@ function DataTable({ title, columns, rows, emptyLabel }: { title: string; column
             </thead>
             <tbody className="divide-y divide-slate-100">
               {rows.map((row) => (
-                <tr key={`${title}-${row.join('|')}`} className="hover:bg-slate-50/60">
+                <tr key={`${title}-${row.map((item) => item.primary).join('|')}`} className="hover:bg-slate-50/60">
                   {row.map((cell, cellIndex) => (
-                    <td key={`${title}-${columns[cellIndex]}-${cell}`} className="px-3 py-2 text-slate-700 align-top max-w-[280px]">
-                      <span className={cellIndex === 3 && title === 'Dimensions' ? confidenceClass(cell) : ''}>{cell || '-'}</span>
+                    <td key={`${title}-${columns[cellIndex]}`} className="px-3 py-2 text-slate-700 align-top max-w-[340px]">
+                      <TableCell cell={cell} />
                     </td>
                   ))}
                 </tr>
@@ -361,22 +473,55 @@ function EmptyState({ label }: { label: string }) {
   return <div className="p-5 text-sm text-slate-400">{label}</div>;
 }
 
+function TableCell({ cell: tableCell }: { cell: TableCellData }) {
+  return (
+    <div>
+      <p className={clsx('break-words', toneClass(tableCell.tone))}>{tableCell.primary || '-'}</p>
+      {tableCell.secondary && <p className="text-xs text-slate-500 mt-1 leading-relaxed break-words">{tableCell.secondary}</p>}
+      {tableCell.meta && <p className="text-[10px] text-slate-400 mt-1 uppercase tracking-wide break-words">{tableCell.meta}</p>}
+      {tableCell.warnings && tableCell.warnings.length > 0 && (
+        <div className="mt-1.5 space-y-1">
+          {tableCell.warnings.slice(0, 2).map((warning) => (
+            <p key={warning} className="flex items-start gap-1 text-[11px] text-amber-700 leading-snug">
+              <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
+              <span>{warning}</span>
+            </p>
+          ))}
+          {tableCell.warnings.length > 2 && <p className="text-[10px] text-amber-600">+{tableCell.warnings.length - 2} more warnings</p>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 interface SummaryData {
   titleFields: [string, unknown][];
   dimensions: JsonRecord[];
   threads: JsonRecord[];
   requirements: JsonRecord[];
+  gdtItems: JsonRecord[];
+  drawingRegions: JsonRecord[];
   reviewItems: JsonRecord[];
+  finalWarnings: string[];
+  warningCount: number;
 }
 
 function buildSummary(finalData: JsonRecord, result: ExtractionResponse): SummaryData {
   const titleBlock = asRecord(finalData.title_block) ?? {};
+  const reviewItems = asRecordArray(finalData.review_items).concat(result.warnings.map((warning) => ({ warning })));
+  const finalWarnings = asStringArray(finalData.warnings);
+  const allRequirements = asRecordArray(finalData.manufacturing_requirements);
+  const gdtItems = allRequirements.filter(isGdtItem);
   return {
     titleFields: Object.entries(titleBlock),
     dimensions: asRecordArray(finalData.dimensions),
     threads: asRecordArray(finalData.threads),
-    requirements: asRecordArray(finalData.manufacturing_requirements),
-    reviewItems: asRecordArray(finalData.review_items).concat(result.warnings.map((warning) => ({ reason: warning }))),
+    requirements: allRequirements.filter((item) => !isGdtItem(item)),
+    gdtItems,
+    drawingRegions: asRecordArray(finalData.drawing_regions),
+    reviewItems,
+    finalWarnings,
+    warningCount: reviewItems.length + finalWarnings.length,
   };
 }
 
@@ -388,12 +533,64 @@ function asRecordArray(value: unknown): JsonRecord[] {
   return Array.isArray(value) ? value.map(asRecord).filter(Boolean) as JsonRecord[] : [];
 }
 
+function asStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(formatValue).filter(Boolean) : [];
+}
+
+function cell(primary: unknown, options: Omit<Partial<TableCellData>, 'primary'> = {}): TableCellData {
+  return {
+    primary: formatValue(primary) || '-',
+    ...options,
+  };
+}
+
 function stringField(record: JsonRecord, key: string): string {
   return formatValue(record[key]);
 }
 
+interface DisplayField {
+  label: string;
+  displayValue: string;
+  description: string;
+  confidence: string;
+  page: string;
+  warnings: string[];
+}
+
+function normalizeField(value: unknown, fallbackKey: string): DisplayField {
+  const record = asRecord(value);
+  if (!record) {
+    return {
+      label: formatLabel(fallbackKey),
+      displayValue: formatValue(value),
+      description: '',
+      confidence: '',
+      page: '',
+      warnings: [],
+    };
+  }
+
+  return {
+    label: stringField(record, 'label') || formatLabel(fallbackKey),
+    displayValue: stringField(record, 'display_value') || stringField(record, 'value'),
+    description: stringField(record, 'description'),
+    confidence: stringField(record, 'confidence'),
+    page: stringField(record, 'page'),
+    warnings: arrayField(record, 'warnings').map(formatValue).filter(Boolean),
+  };
+}
+
+function arrayField(record: JsonRecord, key: string): unknown[] {
+  const value = record[key];
+  return Array.isArray(value) ? value : [];
+}
+
 function formatLabel(value: string): string {
-  return value.replace(/_/g, ' ');
+  return value
+    .replace(/_/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 function formatValue(value: unknown): string {
@@ -401,7 +598,9 @@ function formatValue(value: unknown): string {
   if (typeof value === 'number') return Number.isInteger(value) ? String(value) : String(value);
   if (typeof value === 'string') return value;
   if (typeof value === 'boolean') return value ? 'true' : 'false';
-  return JSON.stringify(value);
+  const nested = asRecord(value);
+  if (nested) return stringField(nested, 'display_value') || stringField(nested, 'value') || stringField(nested, 'label') || '';
+  return '';
 }
 
 function compactDimension(record: JsonRecord): string {
@@ -410,6 +609,16 @@ function compactDimension(record: JsonRecord): string {
   const value = formatValue(record.value);
   const unit = stringField(record, 'unit');
   return [value, unit].filter(Boolean).join(' ');
+}
+
+function dimensionMeta(record: JsonRecord): string {
+  const pieces = [
+    stringField(record, 'dimension_type'),
+    stringField(record, 'role'),
+    stringField(record, 'quantity') ? `qty ${stringField(record, 'quantity')}` : '',
+    stringField(record, 'angle_value') ? `${stringField(record, 'angle_value')} ${stringField(record, 'angle_unit') || 'deg'}` : '',
+  ].filter(Boolean);
+  return pieces.join(' · ');
 }
 
 function threadLabel(record: JsonRecord): string {
@@ -421,12 +630,83 @@ function threadLabel(record: JsonRecord): string {
   return size || stringField(record, 'label');
 }
 
-function confidenceClass(value: string): string {
+function confidenceTone(value: string): CellTone {
   const normalized = value.toLowerCase();
-  if (normalized === 'high') return 'text-emerald-700 font-semibold';
-  if (normalized === 'medium') return 'text-amber-700 font-semibold';
-  if (normalized === 'low' || normalized === 'review') return 'text-red-700 font-semibold';
-  return '';
+  if (normalized === 'high') return 'success';
+  if (normalized === 'medium') return 'warning';
+  if (normalized === 'low' || normalized === 'review') return 'danger';
+  return 'normal';
+}
+
+function toneClass(tone: CellTone = 'normal'): string {
+  if (tone === 'success') return 'text-emerald-700 font-semibold';
+  if (tone === 'warning') return 'text-amber-700 font-semibold';
+  if (tone === 'danger') return 'text-red-700 font-semibold';
+  if (tone === 'muted') return 'text-slate-500';
+  return 'text-slate-800';
+}
+
+function warningList(record: JsonRecord): string[] {
+  return arrayField(record, 'warnings').map(formatValue).filter(Boolean);
+}
+
+function isGdtItem(record: JsonRecord): boolean {
+  const label = stringField(record, 'label').toLowerCase();
+  const requirementType = stringField(record, 'requirement_type').toLowerCase();
+  const semanticLabel = stringField(record, 'semantic_label').toLowerCase();
+  const text = [
+    label,
+    requirementType,
+    semanticLabel,
+    stringField(record, 'value'),
+    stringField(record, 'display_value'),
+    stringField(record, 'description'),
+    stringField(record, 'evidence'),
+  ].join(' ').toLowerCase();
+
+  if (label.includes('gd&t') || requirementType.includes('gdt')) return true;
+  if (text.includes('feature control frame')) return true;
+  if (semanticLabel.includes('flatness') || semanticLabel.includes('perpendicularity') || semanticLabel.includes('position control')) return true;
+  return text.includes('flatness') && text.includes('0.002');
+}
+
+function reviewItemKey(record: JsonRecord): string {
+  const key = [
+    stringField(record, 'target_id'),
+    stringField(record, 'item_type'),
+    stringField(record, 'reason'),
+    stringField(record, 'warning'),
+    stringField(record, 'evidence'),
+    formatValue(record.value),
+  ].filter(Boolean).join('|');
+  return key || JSON.stringify(record);
+}
+
+function ConfidenceBadge({ value }: { value: string }) {
+  if (!value) return null;
+  const normalized = value.toLowerCase();
+  const className = clsx(
+    'rounded px-1.5 py-0.5 text-[10px] font-bold uppercase',
+    normalized === 'high' && 'bg-emerald-50 text-emerald-700',
+    normalized === 'medium' && 'bg-amber-50 text-amber-700',
+    (normalized === 'low' || normalized === 'review') && 'bg-red-50 text-red-700',
+    !['high', 'medium', 'low', 'review'].includes(normalized) && 'bg-slate-100 text-slate-500',
+  );
+  return <span className={className}>{value}</span>;
+}
+
+function FieldMeta({ page, warnings }: { page: string; warnings: string[] }) {
+  if (!page && warnings.length === 0) return null;
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px]">
+      {page && <span className="rounded bg-slate-100 px-1.5 py-0.5 font-semibold text-slate-500">Page {page}</span>}
+      {warnings.length > 0 && (
+        <span className="rounded bg-amber-50 px-1.5 py-0.5 font-semibold text-amber-700">
+          {warnings.length === 1 ? '1 warning' : `${warnings.length} warnings`}
+        </span>
+      )}
+    </div>
+  );
 }
 
 interface TabButtonProps {
