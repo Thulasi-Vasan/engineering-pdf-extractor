@@ -799,6 +799,10 @@ def _split_vector_cluster(cluster: list[object], depth: int = 0) -> list[list[ob
             axis_candidates.append((gap, axis, left, right))
 
     if not axis_candidates:
+        fallback_split = _wide_cluster_gap_split(cluster, width, height)
+        if fallback_split is not None:
+            first, second = fallback_split
+            return [first, second]
         return [cluster]
 
     _, _, first, second = max(axis_candidates, key=lambda item: item[0])
@@ -826,6 +830,41 @@ def _best_cluster_gap_split(
         if best is None or gap > best[0]:
             best = (gap, left, right)
     return best
+
+
+def _wide_cluster_gap_split(
+    cluster: list[object],
+    width: float,
+    height: float,
+) -> tuple[list[object], list[object]] | None:
+    if len(cluster) < 160 or width < 500 or height < 120 or width / max(height, 1.0) < 2.2:
+        return None
+
+    indexed = sorted(cluster, key=lambda primitive: _primitive_center(primitive)[0])
+    centers = [_primitive_center(primitive)[0] for primitive in indexed]
+    min_side = max(24, int(len(indexed) * 0.18))
+    threshold = max(24.0, min(45.0, width * 0.025))
+    best: tuple[float, list[object], list[object]] | None = None
+    for index in range(min_side, len(indexed) - min_side):
+        gap = centers[index] - centers[index - 1]
+        if gap < threshold:
+            continue
+        left = indexed[:index]
+        right = indexed[index:]
+        if not _valid_wide_split_cluster(left) or not _valid_wide_split_cluster(right):
+            continue
+        if best is None or gap > best[0]:
+            best = (gap, left, right)
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
+def _valid_wide_split_cluster(cluster: list[object]) -> bool:
+    if len(cluster) < 60:
+        return False
+    x0, top, x1, bottom = _primitive_bbox(cluster)
+    return (x1 - x0) >= 120 and (bottom - top) >= 80
 
 
 def _valid_split_cluster(cluster: list[object]) -> bool:
