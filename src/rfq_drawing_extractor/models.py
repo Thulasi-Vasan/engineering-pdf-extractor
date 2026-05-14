@@ -319,6 +319,23 @@ class LLMReviewItem(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class LLMEnrichmentUpdate(BaseModel):
+    target_id: str = ""
+    label: str = ""
+    description: str = ""
+    view_label: str = ""
+    semantic_label: str = ""
+    display_value: Any = None
+    review_reason: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
+class LLMEnrichmentResponse(BaseModel):
+    updates: list[LLMEnrichmentUpdate] = Field(default_factory=list)
+    review_items: list[LLMReviewItem] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class LLMFinalDimension(BaseModel):
     value: Any = None
     unit: str = ""
@@ -350,6 +367,8 @@ class LLMFinalThread(BaseModel):
     thread_class: str = ""
     source_type: str = ""
     label: str = ""
+    description: str = ""
+    display_value: Any = None
     region_id: str = ""
     page: int | None = None
     confidence: ConfidenceLabel = "review"
@@ -361,6 +380,8 @@ class LLMFinalTable(BaseModel):
     table_type: str = ""
     table_id: str = ""
     title: str = ""
+    description: str = ""
+    display_value: Any = None
     headers: list[str] = Field(default_factory=list)
     rows: list[dict[str, Any]] = Field(default_factory=list)
     page: int | None = None
@@ -373,6 +394,8 @@ class LLMFinalManufacturingRequirement(BaseModel):
     requirement_type: str = ""
     value: Any = None
     label: str = ""
+    description: str = ""
+    display_value: Any = None
     region_id: str = ""
     page: int | None = None
     confidence: ConfidenceLabel = "review"
@@ -385,6 +408,8 @@ class LLMFinalDrawingRegion(BaseModel):
     region_type: str = ""
     label: str = ""
     semantic_label: str = ""
+    description: str = ""
+    display_value: Any = None
     page: int | None = None
     confidence: ConfidenceLabel = "review"
     evidence: str = ""
