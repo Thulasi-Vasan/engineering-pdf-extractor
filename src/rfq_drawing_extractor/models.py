@@ -337,6 +337,10 @@ class LLMEnrichmentResponse(BaseModel):
 
 
 class LLMFinalDimension(BaseModel):
+    target_id: str = ""
+    duplicate_of: str | None = None
+    linked_dimensions: list[str] = Field(default_factory=list)
+    is_duplicate: bool = False
     value: Any = None
     unit: str = ""
     secondary_value: Any = None
