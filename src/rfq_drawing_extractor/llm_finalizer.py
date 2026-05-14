@@ -11,9 +11,12 @@ from pydantic import ValidationError
 
 from .models import (
     LLMEnrichmentResponse,
+    LLMFinalBomItem,
+    LLMFinalConnection,
     LLMFinalDimension,
     LLMFinalDrawingRegion,
     LLMFinalEngineeringData,
+    LLMFinalField,
     LLMFinalManufacturingRequirement,
     LLMFinalTable,
     LLMFinalThread,
@@ -24,6 +27,21 @@ from .models import (
     StructuredEngineeringData,
 )
 from .vision_dimensions import DEFAULT_BEDROCK_VISION_MODEL
+
+
+MAX_ENRICHMENT_TARGETS = 110
+SECTION_ENRICHMENT_LIMITS = {
+    "dimensions": 35,
+    "threads": 25,
+    "bom_items": 45,
+    "tables": 10,
+    "standards": 10,
+    "engineering_requirements": 25,
+    "manufacturing_requirements": 25,
+    "notes": 8,
+    "connections": 25,
+    "drawing_regions": 12,
+}
 
 
 def finalize_engineering_data_with_llm(
@@ -188,6 +206,7 @@ def _finalizer_prompt(context: dict[str, Any]) -> str:
         "}\n\n"
         "Rules:\n"
         "- Only use target_id values from enrichment_targets.\n"
+        "- Enrichment targets may include title_block, dimensions, threads, bom_items, tables, standards, engineering_requirements, manufacturing_requirements, notes, connections, overall_envelope, and drawing_regions.\n"
         "- Do not return the final engineering JSON; return only updates, review_items, and warnings.\n"
         "- Allowed update fields are target_id, label, description, view_label, semantic_label, display_value, review_reason, and warnings.\n"
         "- Do not change values, units, raw_callout, page, source, region_id, dimension_type, thread_size, thread_class, confidence, or evidence.\n"
@@ -244,15 +263,19 @@ def _structured_context(structured: StructuredEngineeringData) -> dict[str, Any]
         "drawing_type": _dump_jsonable(structured.drawing_type),
         "units": _dump_jsonable(structured.units),
         "standards": _dump_jsonable(structured.standards),
+        "bom_components": _dump_jsonable(structured.bom_components),
         "dimensions": _dump_jsonable(structured.dimensions),
         "review_dimensions": _dump_jsonable(structured.review_dimensions),
         "thread_requirements": _dump_jsonable(structured.thread_requirements),
         "engineering_requirements": _dump_jsonable(structured.engineering_requirements),
         "manufacturing_requirements": _dump_jsonable(structured.manufacturing_requirements),
         "process_requirements": _dump_jsonable(structured.process_requirements),
+        "connections": _dump_jsonable(structured.connections),
+        "notes": _dump_jsonable(structured.notes),
         "engineering_tables": _dump_jsonable(structured.engineering_tables),
         "drawing_regions": _dump_jsonable(structured.drawing_regions),
         "tolerances_gdnt": _dump_jsonable(structured.tolerances_gdnt),
+        "overall_envelope": _dump_jsonable(structured.overall_envelope),
         "drawing_structure": structured.drawing_structure,
         "warnings": structured.warnings,
     }
@@ -281,11 +304,32 @@ def _build_base_final_data(structured: StructuredEngineeringData) -> LLMFinalEng
             _thread_from_structured(thread)
             for thread in _list_of_dicts(_dump_jsonable(structured.thread_requirements))
         ],
+        bom_items=[
+            _bom_item_from_structured(component)
+            for component in _list_of_dicts(_dump_jsonable(structured.bom_components))
+        ],
         tables=[
             _table_from_structured(table)
             for table in _list_of_dicts(_dump_jsonable(structured.engineering_tables))
         ],
+        standards=[
+            _field_from_structured(field, "standard")
+            for field in _list_of_dicts(_dump_jsonable(structured.standards))
+        ],
+        engineering_requirements=[
+            _engineering_requirement_from_structured(requirement)
+            for requirement in _list_of_dicts(_dump_jsonable(structured.engineering_requirements))
+        ],
         manufacturing_requirements=_base_manufacturing_requirements(structured),
+        notes=[
+            _field_from_structured(note, "note")
+            for note in _list_of_dicts(_dump_jsonable(structured.notes))
+        ],
+        connections=[
+            _connection_from_structured(connection)
+            for connection in _list_of_dicts(_dump_jsonable(structured.connections))
+        ],
+        overall_envelope=_overall_envelope_from_structured(structured),
         drawing_regions=[
             _drawing_region_from_structured(region)
             for region in _list_of_dicts(_dump_jsonable(structured.drawing_regions))
@@ -332,6 +376,23 @@ def _thread_from_structured(thread: dict[str, Any]) -> LLMFinalThread:
     )
 
 
+def _bom_item_from_structured(component: dict[str, Any]) -> LLMFinalBomItem:
+    return LLMFinalBomItem(
+        item_no=str(component.get("item_no") or ""),
+        component_name=str(component.get("component_name") or ""),
+        quantity=component.get("quantity"),
+        material=component.get("material"),
+        note=str(component.get("note") or ""),
+        category=str(component.get("category") or ""),
+        label=str(component.get("component_name") or component.get("item_no") or ""),
+        source=str(component.get("source") or ""),
+        page=component.get("page"),
+        confidence=component.get("confidence") or "review",
+        evidence=str(component.get("evidence") or ""),
+        warnings=list(component.get("warnings") or []),
+    )
+
+
 def _table_from_structured(table: dict[str, Any]) -> LLMFinalTable:
     return LLMFinalTable(
         table_type=str(table.get("table_type") or ""),
@@ -343,6 +404,38 @@ def _table_from_structured(table: dict[str, Any]) -> LLMFinalTable:
         confidence=table.get("confidence") or "review",
         evidence=str(table.get("evidence") or ""),
         warnings=list(table.get("warnings") or []),
+    )
+
+
+def _field_from_structured(field: dict[str, Any], field_type: str) -> LLMFinalField:
+    value = field.get("value")
+    return LLMFinalField(
+        field_type=field_type,
+        value=value,
+        label=_label_from_requirement_type(field_type),
+        display_value=value,
+        source=str(field.get("source") or ""),
+        page=field.get("page"),
+        confidence=field.get("confidence") or "review",
+        evidence=str(field.get("evidence") or ""),
+        warnings=list(field.get("warnings") or []),
+    )
+
+
+def _engineering_requirement_from_structured(requirement: dict[str, Any]) -> LLMFinalField:
+    requirement_type = str(requirement.get("requirement_type") or "requirement")
+    value = requirement.get("value")
+    return LLMFinalField(
+        field_type=requirement_type,
+        value=value,
+        label=_label_from_requirement_type(requirement_type),
+        display_value=_requirement_display_value(value, requirement_type),
+        region_id=str(requirement.get("region_id") or ""),
+        source=str(requirement.get("source") or ""),
+        page=requirement.get("page"),
+        confidence=requirement.get("confidence") or "review",
+        evidence=str(requirement.get("evidence") or ""),
+        warnings=list(requirement.get("warnings") or []),
     )
 
 
@@ -502,6 +595,25 @@ def _drawing_region_from_structured(region: dict[str, Any]) -> LLMFinalDrawingRe
     )
 
 
+def _connection_from_structured(connection: dict[str, Any]) -> LLMFinalConnection:
+    return LLMFinalConnection(
+        label=str(connection.get("label") or ""),
+        size=str(connection.get("size") or ""),
+        connection_type=str(connection.get("connection_type") or ""),
+        option=bool(connection.get("option")),
+        source=str(connection.get("source") or ""),
+        page=connection.get("page"),
+        confidence=connection.get("confidence") or "review",
+        evidence=str(connection.get("evidence") or ""),
+        warnings=list(connection.get("warnings") or []),
+    )
+
+
+def _overall_envelope_from_structured(structured: StructuredEngineeringData) -> dict[str, Any]:
+    envelope = _dump_jsonable(structured.overall_envelope)
+    return envelope if isinstance(envelope, dict) else {}
+
+
 def _add_base_review_items(final_data: LLMFinalEngineeringData, structured: StructuredEngineeringData) -> None:
     for dimension in _list_of_dicts(_dump_jsonable(structured.review_dimensions)):
         final_data.review_items.append(
@@ -519,36 +631,158 @@ def _add_base_review_items(final_data: LLMFinalEngineeringData, structured: Stru
 
 def _enrichment_targets(final_data: LLMFinalEngineeringData) -> list[dict[str, Any]]:
     targets: list[dict[str, Any]] = []
+    skipped_by_section: dict[str, int] = {}
     for key, value in final_data.title_block.items():
         targets.append({"target_id": f"title_block.{key}", "record_type": "title_block", "data": value})
-    targets.extend(
-        {"target_id": f"dimensions.{index}", "record_type": "dimension", "data": item.model_dump(mode="json")}
-        for index, item in enumerate(final_data.dimensions)
+    _append_section_targets(targets, skipped_by_section, "dimensions", "dimension", final_data.dimensions)
+    _append_section_targets(targets, skipped_by_section, "threads", "thread", final_data.threads)
+    _append_section_targets(targets, skipped_by_section, "bom_items", "bom_item", final_data.bom_items)
+    _append_section_targets(targets, skipped_by_section, "tables", "table", final_data.tables)
+    _append_section_targets(targets, skipped_by_section, "standards", "standard", final_data.standards)
+    _append_section_targets(
+        targets,
+        skipped_by_section,
+        "engineering_requirements",
+        "engineering_requirement",
+        final_data.engineering_requirements,
     )
-    targets.extend(
-        {"target_id": f"threads.{index}", "record_type": "thread", "data": item.model_dump(mode="json")}
-        for index, item in enumerate(final_data.threads)
+    _append_section_targets(
+        targets,
+        skipped_by_section,
+        "manufacturing_requirements",
+        "manufacturing_requirement",
+        final_data.manufacturing_requirements,
     )
-    targets.extend(
-        {"target_id": f"tables.{index}", "record_type": "table", "data": item.model_dump(mode="json")}
-        for index, item in enumerate(final_data.tables)
-    )
-    targets.extend(
-        {
-            "target_id": f"manufacturing_requirements.{index}",
-            "record_type": "manufacturing_requirement",
-            "data": item.model_dump(mode="json"),
-        }
-        for index, item in enumerate(final_data.manufacturing_requirements)
-    )
-    targets.extend(
-        {
-            "target_id": f"drawing_regions.{index}",
-            "record_type": "drawing_region",
-            "data": item.model_dump(mode="json"),
-        }
-        for index, item in enumerate(final_data.drawing_regions)
-    )
+    _append_note_targets(targets, skipped_by_section, final_data.notes)
+    _append_section_targets(targets, skipped_by_section, "connections", "connection", final_data.connections)
+    _append_section_targets(targets, skipped_by_section, "drawing_regions", "drawing_region", final_data.drawing_regions)
+    targets.extend(_overall_envelope_targets(final_data.overall_envelope))
+    targets = _apply_total_target_budget(targets, skipped_by_section)
+    _record_skipped_target_warnings(final_data, skipped_by_section)
+    return targets
+
+
+def _append_section_targets(
+    targets: list[dict[str, Any]],
+    skipped_by_section: dict[str, int],
+    section: str,
+    record_type: str,
+    records: list[Any],
+) -> None:
+    limit = SECTION_ENRICHMENT_LIMITS.get(section, len(records))
+    for index, item in enumerate(records):
+        if index >= limit:
+            skipped_by_section[section] = skipped_by_section.get(section, 0) + 1
+            continue
+        targets.append(
+            {
+                "target_id": f"{section}.{index}",
+                "record_type": record_type,
+                "data": item.model_dump(mode="json"),
+            }
+        )
+
+
+def _append_note_targets(
+    targets: list[dict[str, Any]],
+    skipped_by_section: dict[str, int],
+    notes: list[LLMFinalField],
+) -> None:
+    limit = SECTION_ENRICHMENT_LIMITS["notes"]
+    included = 0
+    for index, note in enumerate(notes):
+        if not _is_standalone_note_for_enrichment(note):
+            skipped_by_section["notes"] = skipped_by_section.get("notes", 0) + 1
+            continue
+        if included >= limit:
+            skipped_by_section["notes"] = skipped_by_section.get("notes", 0) + 1
+            continue
+        included += 1
+        targets.append(
+            {
+                "target_id": f"notes.{index}",
+                "record_type": "note",
+                "data": note.model_dump(mode="json"),
+            }
+        )
+
+
+def _is_standalone_note_for_enrichment(note: LLMFinalField) -> bool:
+    text = _match_text(" ".join([str(note.value or ""), note.evidence, note.label, note.description]))
+    if len(text) < 8 or text in {"option", "standard", "service valve"}:
+        return False
+    high_value_terms = [
+        "application",
+        "standard notes",
+        "unless otherwise",
+        "legal note",
+        "drawing use",
+        "disclosure",
+        "restriction",
+    ]
+    if any(term in text for term in high_value_terms) and not _looks_like_bom_or_dimension_fragment(text):
+        return True
+    return False
+
+
+def _looks_like_bom_or_dimension_fragment(text: str) -> bool:
+    if re.search(r"\b\d+\s+[a-z][a-z0-9/\"() .-]+?\b\d+\s+[a-z]", text):
+        return True
+    bom_terms = [
+        "angle valve",
+        "discharge flange",
+        "solenoid valve",
+        "liquid injection",
+        "capillary",
+        "checkvalve",
+        "check valve",
+        "oil drain",
+        "oil level",
+        "oil connector",
+        "oil sight glass",
+        "safety valve",
+        "service flange",
+        "service valve",
+        "cable box",
+        "flare",
+        "npt",
+    ]
+    term_count = sum(1 for term in bom_terms if term in text)
+    number_count = len(re.findall(r"\b\d+(?:\.\d+)?\b", text))
+    return term_count >= 2 or (term_count >= 1 and number_count >= 3)
+
+
+def _apply_total_target_budget(
+    targets: list[dict[str, Any]],
+    skipped_by_section: dict[str, int],
+) -> list[dict[str, Any]]:
+    if len(targets) <= MAX_ENRICHMENT_TARGETS:
+        return targets
+    kept = targets[:MAX_ENRICHMENT_TARGETS]
+    for target in targets[MAX_ENRICHMENT_TARGETS:]:
+        section = str(target.get("target_id", "")).split(".", 1)[0] or "unknown"
+        skipped_by_section[section] = skipped_by_section.get(section, 0) + 1
+    return kept
+
+
+def _record_skipped_target_warnings(
+    final_data: LLMFinalEngineeringData,
+    skipped_by_section: dict[str, int],
+) -> None:
+    for section, count in sorted(skipped_by_section.items()):
+        if count <= 0:
+            continue
+        final_data.warnings.append(
+            f"Skipped {count} {section} target{'s' if count != 1 else ''} from Claude enrichment to reduce JSON size."
+        )
+
+
+def _overall_envelope_targets(overall_envelope: dict[str, Any]) -> list[dict[str, Any]]:
+    targets: list[dict[str, Any]] = []
+    for key in ("length", "breadth", "height", "surface_area", "volume"):
+        value = overall_envelope.get(key)
+        if isinstance(value, dict) and any(item not in (None, "", [], {}) for item in value.values()):
+            targets.append({"target_id": f"overall_envelope.{key}", "record_type": "overall_envelope", "data": value})
     return targets
 
 
@@ -728,14 +962,28 @@ def _target_registry(final_data: LLMFinalEngineeringData) -> dict[str, Any]:
         targets[f"title_block.{key}"] = value
     targets.update({f"dimensions.{index}": item for index, item in enumerate(final_data.dimensions)})
     targets.update({f"threads.{index}": item for index, item in enumerate(final_data.threads)})
+    targets.update({f"bom_items.{index}": item for index, item in enumerate(final_data.bom_items)})
     targets.update({f"tables.{index}": item for index, item in enumerate(final_data.tables)})
+    targets.update({f"standards.{index}": item for index, item in enumerate(final_data.standards)})
+    targets.update(
+        {
+            f"engineering_requirements.{index}": item
+            for index, item in enumerate(final_data.engineering_requirements)
+        }
+    )
     targets.update(
         {
             f"manufacturing_requirements.{index}": item
             for index, item in enumerate(final_data.manufacturing_requirements)
         }
     )
+    targets.update({f"notes.{index}": item for index, item in enumerate(final_data.notes)})
+    targets.update({f"connections.{index}": item for index, item in enumerate(final_data.connections)})
     targets.update({f"drawing_regions.{index}": item for index, item in enumerate(final_data.drawing_regions)})
+    for key in ("length", "breadth", "height", "surface_area", "volume"):
+        value = final_data.overall_envelope.get(key)
+        if isinstance(value, dict):
+            targets[f"overall_envelope.{key}"] = value
     return targets
 
 
@@ -769,6 +1017,10 @@ def _apply_dict_semantic_update(target: dict[str, Any], update: Any) -> None:
         target["label"] = _clip_text(update.label, 80)
     if update.description:
         target["description"] = _clip_text(update.description, 300)
+    if update.view_label:
+        target["view_label"] = _clip_text(update.view_label, 80)
+    if update.semantic_label:
+        target["semantic_label"] = _clip_text(update.semantic_label, 160)
     if update.display_value is not None:
         target["display_value"] = update.display_value
     if update.warnings:
@@ -960,8 +1212,13 @@ def _merge_warnings(*warning_lists: Any) -> list[str]:
 def _apply_evidence_guardrails(final_data: LLMFinalEngineeringData) -> None:
     _require_evidence(final_data.dimensions, "dimension", final_data)
     _require_evidence(final_data.threads, "thread", final_data)
+    _require_evidence(final_data.bom_items, "bom_item", final_data)
     _require_evidence(final_data.tables, "table", final_data)
+    _require_evidence(final_data.standards, "standard", final_data)
+    _require_evidence(final_data.engineering_requirements, "engineering_requirement", final_data)
     _require_evidence(final_data.manufacturing_requirements, "manufacturing_requirement", final_data)
+    _require_evidence(final_data.notes, "note", final_data)
+    _require_evidence(final_data.connections, "connection", final_data)
     _require_evidence(final_data.drawing_regions, "drawing_region", final_data)
 
 
