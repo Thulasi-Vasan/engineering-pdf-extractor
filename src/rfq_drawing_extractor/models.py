@@ -376,6 +376,24 @@ class LLMFinalThread(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class LLMFinalBomItem(BaseModel):
+    item_no: str = ""
+    component_name: str = ""
+    quantity: int | None = None
+    material: str | None = None
+    note: str = ""
+    category: str = ""
+    label: str = ""
+    description: str = ""
+    display_value: Any = None
+    semantic_label: str = ""
+    source: str = ""
+    page: int | None = None
+    confidence: ConfidenceLabel = "review"
+    evidence: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
 class LLMFinalTable(BaseModel):
     table_type: str = ""
     table_id: str = ""
@@ -390,6 +408,21 @@ class LLMFinalTable(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class LLMFinalField(BaseModel):
+    field_type: str = ""
+    value: Any = None
+    label: str = ""
+    description: str = ""
+    display_value: Any = None
+    semantic_label: str = ""
+    region_id: str = ""
+    source: str = ""
+    page: int | None = None
+    confidence: ConfidenceLabel = "review"
+    evidence: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
 class LLMFinalManufacturingRequirement(BaseModel):
     requirement_type: str = ""
     value: Any = None
@@ -397,6 +430,21 @@ class LLMFinalManufacturingRequirement(BaseModel):
     description: str = ""
     display_value: Any = None
     region_id: str = ""
+    page: int | None = None
+    confidence: ConfidenceLabel = "review"
+    evidence: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
+class LLMFinalConnection(BaseModel):
+    label: str = ""
+    size: str = ""
+    connection_type: str = ""
+    option: bool = False
+    description: str = ""
+    display_value: Any = None
+    semantic_label: str = ""
+    source: str = ""
     page: int | None = None
     confidence: ConfidenceLabel = "review"
     evidence: str = ""
@@ -422,8 +470,14 @@ class LLMFinalEngineeringData(BaseModel):
     units: Any = None
     dimensions: list[LLMFinalDimension] = Field(default_factory=list)
     threads: list[LLMFinalThread] = Field(default_factory=list)
+    bom_items: list[LLMFinalBomItem] = Field(default_factory=list)
     tables: list[LLMFinalTable] = Field(default_factory=list)
+    standards: list[LLMFinalField] = Field(default_factory=list)
+    engineering_requirements: list[LLMFinalField] = Field(default_factory=list)
     manufacturing_requirements: list[LLMFinalManufacturingRequirement] = Field(default_factory=list)
+    notes: list[LLMFinalField] = Field(default_factory=list)
+    connections: list[LLMFinalConnection] = Field(default_factory=list)
+    overall_envelope: dict[str, Any] = Field(default_factory=dict)
     drawing_regions: list[LLMFinalDrawingRegion] = Field(default_factory=list)
     review_items: list[LLMReviewItem] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)

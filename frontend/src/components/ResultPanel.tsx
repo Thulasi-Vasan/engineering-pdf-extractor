@@ -264,9 +264,10 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
 function SummaryView({ summary }: { summary: SummaryData }) {
   return (
     <div className="flex-1 overflow-auto bg-slate-50/40 p-5 space-y-5">
-      <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+      <div className="grid grid-cols-2 lg:grid-cols-6 gap-3">
         <Metric label="Dimensions" value={summary.dimensions.length} />
         <Metric label="Threads" value={summary.threads.length} />
+        <Metric label="BOM Items" value={summary.bomItems.length} />
         <Metric label="GD&T" value={summary.gdtItems.length} tone={summary.gdtItems.length ? 'warning' : 'normal'} />
         <Metric label="Requirements" value={summary.requirements.length} />
         <Metric label="Review Items" value={summary.reviewItems.length} tone={summary.reviewItems.length ? 'warning' : 'normal'} />
@@ -295,6 +296,30 @@ function SummaryView({ summary }: { summary: SummaryData }) {
           )}
         </div>
       </section>
+
+      {summary.bomItems.length > 0 && (
+        <DataTable
+          title="BOM / Parts"
+          columns={['Item', 'Component', 'Quantity / Material', 'Confidence', 'Evidence']}
+          rows={summary.bomItems.slice(0, 20).map((item) => [
+            cell(stringField(item, 'item_no') || '-'),
+            cell(stringField(item, 'label') || stringField(item, 'component_name'), {
+              secondary: stringField(item, 'description') || stringField(item, 'note'),
+              warnings: warningList(item),
+            }),
+            cell(stringField(item, 'quantity') || '-', {
+              secondary: stringField(item, 'material') || stringField(item, 'category'),
+            }),
+            cell(stringField(item, 'confidence') || '-', {
+              tone: confidenceTone(stringField(item, 'confidence')),
+            }),
+            cell(stringField(item, 'evidence') || '-', {
+              secondary: [stringField(item, 'source'), stringField(item, 'page') ? `page ${stringField(item, 'page')}` : ''].filter(Boolean).join(' · '),
+            }),
+          ])}
+          emptyLabel="No BOM or part rows returned."
+        />
+      )}
 
       <DataTable
         title="Dimensions"
@@ -389,6 +414,44 @@ function SummaryView({ summary }: { summary: SummaryData }) {
         ])}
         emptyLabel="No manufacturing requirements returned."
       />
+
+      {(summary.standards.length > 0 || summary.engineeringRequirements.length > 0 || summary.connections.length > 0 || summary.notes.length > 0) && (
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
+          <DataTable
+            title="Standards & Engineering Requirements"
+            columns={['Type', 'Value', 'Confidence', 'Evidence']}
+            rows={[...summary.standards, ...summary.engineeringRequirements].slice(0, 16).map((item) => [
+              cell(stringField(item, 'label') || formatLabel(stringField(item, 'field_type') || 'requirement'), {
+                secondary: stringField(item, 'description'),
+                warnings: warningList(item),
+              }),
+              cell(stringField(item, 'display_value') || formatValue(item.value)),
+              cell(stringField(item, 'confidence') || '-', { tone: confidenceTone(stringField(item, 'confidence')) }),
+              cell(stringField(item, 'evidence') || '-', {
+                secondary: [stringField(item, 'source'), stringField(item, 'page') ? `page ${stringField(item, 'page')}` : ''].filter(Boolean).join(' · '),
+              }),
+            ])}
+            emptyLabel="No standards or engineering requirements returned."
+          />
+
+          <DataTable
+            title="Connections & Notes"
+            columns={['Type', 'Value', 'Confidence', 'Evidence']}
+            rows={[...summary.connections.map(connectionToFeatureRow), ...summary.notes].slice(0, 16).map((item) => [
+              cell(stringField(item, 'label') || formatLabel(stringField(item, 'field_type') || stringField(item, 'connection_type') || 'note'), {
+                secondary: stringField(item, 'description'),
+                warnings: warningList(item),
+              }),
+              cell(stringField(item, 'display_value') || formatValue(item.value) || stringField(item, 'size')),
+              cell(stringField(item, 'confidence') || '-', { tone: confidenceTone(stringField(item, 'confidence')) }),
+              cell(stringField(item, 'evidence') || '-', {
+                secondary: [stringField(item, 'source'), stringField(item, 'page') ? `page ${stringField(item, 'page')}` : ''].filter(Boolean).join(' · '),
+              }),
+            ])}
+            emptyLabel="No connections or notes returned."
+          />
+        </div>
+      )}
 
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
         <DataTable
@@ -498,8 +561,13 @@ interface SummaryData {
   titleFields: [string, unknown][];
   dimensions: JsonRecord[];
   threads: JsonRecord[];
+  bomItems: JsonRecord[];
+  standards: JsonRecord[];
+  engineeringRequirements: JsonRecord[];
   requirements: JsonRecord[];
   gdtItems: JsonRecord[];
+  notes: JsonRecord[];
+  connections: JsonRecord[];
   drawingRegions: JsonRecord[];
   reviewItems: JsonRecord[];
   finalWarnings: string[];
@@ -516,8 +584,13 @@ function buildSummary(finalData: JsonRecord, result: ExtractionResponse): Summar
     titleFields: Object.entries(titleBlock),
     dimensions: asRecordArray(finalData.dimensions),
     threads: asRecordArray(finalData.threads),
+    bomItems: asRecordArray(finalData.bom_items),
+    standards: asRecordArray(finalData.standards),
+    engineeringRequirements: asRecordArray(finalData.engineering_requirements),
     requirements: allRequirements.filter((item) => !isGdtItem(item)),
     gdtItems,
+    notes: asRecordArray(finalData.notes),
+    connections: asRecordArray(finalData.connections),
     drawingRegions: asRecordArray(finalData.drawing_regions),
     reviewItems,
     finalWarnings,
@@ -628,6 +701,15 @@ function threadLabel(record: JsonRecord): string {
   if (pitch) return `${size} x ${pitch}`;
   if (tpi) return `${size}-${tpi}`;
   return size || stringField(record, 'label');
+}
+
+function connectionToFeatureRow(record: JsonRecord): JsonRecord {
+  return {
+    ...record,
+    field_type: stringField(record, 'connection_type') || 'connection',
+    value: stringField(record, 'size') || stringField(record, 'label'),
+    display_value: stringField(record, 'display_value') || stringField(record, 'size'),
+  };
 }
 
 function confidenceTone(value: string): CellTone {
