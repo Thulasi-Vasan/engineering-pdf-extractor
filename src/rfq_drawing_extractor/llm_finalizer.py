@@ -59,6 +59,7 @@ def finalize_engineering_data_with_llm(
     warnings: list[str] = []
     try:
         final_data = _build_base_final_data(structured)
+        _link_dual_unit_dimensions(final_data)
         try:
             image_bytes = _render_pages_to_png_300_dpi(pdf_path, [page.page_number for page in raw.pages])
             context = _build_finalizer_context(page_detection, raw, structured, final_data)
@@ -346,6 +347,7 @@ def _build_base_final_data(structured: StructuredEngineeringData) -> LLMFinalEng
         warnings=list(structured.warnings),
     )
     _add_base_review_items(final_data, structured)
+    _assign_dimension_target_ids(final_data.dimensions)
     return final_data
 
 
@@ -1102,6 +1104,94 @@ def _complete_final_data_from_structured(
         completed_dimensions.append(added_dimension)
 
     final_data.dimensions = completed_dimensions
+    _assign_dimension_target_ids(final_data.dimensions)
+    _link_dual_unit_dimensions(final_data)
+
+
+def _assign_dimension_target_ids(dimensions: list[LLMFinalDimension]) -> None:
+    for index, dimension in enumerate(dimensions):
+        dimension.target_id = f"dimensions.{index}"
+
+
+def _link_dual_unit_dimensions(final_data: LLMFinalEngineeringData) -> None:
+    _assign_dimension_target_ids(final_data.dimensions)
+    final_data.review_items = [
+        item for item in final_data.review_items if item.item_type != "duplicate_dimension"
+    ]
+    for dimension in final_data.dimensions:
+        dimension.is_duplicate = False
+        dimension.duplicate_of = None
+        dimension.linked_dimensions = []
+
+    linked_pairs: list[tuple[LLMFinalDimension, LLMFinalDimension]] = []
+    for primary in final_data.dimensions:
+        if primary.unit != "mm" or primary.imperial_value is None:
+            continue
+        for candidate in final_data.dimensions:
+            if candidate is primary or candidate.is_duplicate or candidate.unit != "inch":
+                continue
+            if not _same_page(primary, candidate):
+                continue
+            if not _compatible_dimension_region(primary, candidate):
+                continue
+            if not _same_number(primary.imperial_value, candidate.value):
+                continue
+            if not _likely_dual_unit_duplicate(primary, candidate):
+                continue
+            candidate.is_duplicate = True
+            candidate.duplicate_of = primary.target_id
+            primary.linked_dimensions = _append_unique(primary.linked_dimensions, candidate.target_id)
+            candidate.linked_dimensions = _append_unique(candidate.linked_dimensions, primary.target_id)
+            linked_pairs.append((primary, candidate))
+
+    for primary, duplicate in linked_pairs:
+        final_data.review_items.append(
+            LLMReviewItem(
+                item_type="duplicate_dimension",
+                value=f"{duplicate.value} in duplicates {primary.value} mm",
+                confidence="review",
+                evidence=_limit_text(
+                    " | ".join(part for part in [primary.evidence, duplicate.evidence] if part),
+                    220,
+                ),
+                page=primary.page,
+                reason=(
+                    f"{duplicate.target_id} appears to be the inch equivalent of {primary.target_id}; "
+                    "keep one primary value for form filling."
+                ),
+                warnings=[],
+            )
+        )
+
+
+def _same_page(first: LLMFinalDimension, second: LLMFinalDimension) -> bool:
+    return first.page is not None and first.page == second.page
+
+
+def _compatible_dimension_region(first: LLMFinalDimension, second: LLMFinalDimension) -> bool:
+    if not first.region_id or not second.region_id:
+        return True
+    if first.region_id == second.region_id:
+        return True
+    return first.region_id.endswith("_drawing_body") or second.region_id.endswith("_drawing_body")
+
+
+def _likely_dual_unit_duplicate(primary: LLMFinalDimension, candidate: LLMFinalDimension) -> bool:
+    primary_text = _match_text(" ".join([primary.raw_callout, primary.normalized_callout, primary.evidence]))
+    candidate_text = _match_text(" ".join([candidate.raw_callout, candidate.normalized_callout, candidate.evidence]))
+    if primary.imperial_value is None:
+        return False
+    if not _same_number(primary.imperial_value, candidate.value):
+        return False
+    if str(candidate.value) in primary_text or str(primary.imperial_value) in primary_text:
+        return True
+    return candidate_text in {str(candidate.value), f"{candidate.value:g}"}
+
+
+def _append_unique(values: list[str], value: str) -> list[str]:
+    if value and value not in values:
+        return [*values, value]
+    return values
 
 
 def _best_dimension_match(
