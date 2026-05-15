@@ -10,10 +10,10 @@ from uuid import uuid4
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from .agent import extract_pdf
-from .chat import ChatCitation, ChatMatch, answer_question_from_final_json
+from .chat import ChatCitation, ChatMatch, answer_question_from_final_json, matches_from_citations
 
 
 API_OUTPUT_ROOT = Path("outputs") / "api-runs"
@@ -150,11 +150,12 @@ def chat_endpoint(request: ChatRequest) -> ChatResponse:
         final_json = _load_json(str(final_json_path))
         if final_json is None:
             raise ValueError("Final JSON could not be loaded.")
-        answer, _query_plan, matches = answer_question_from_final_json(
+        answer = answer_question_from_final_json(
             final_json=final_json,
             question=request.question.strip(),
         )
-    except (ValueError, RuntimeError) as exc:
+        matches = matches_from_citations(answer.citations)
+    except (json.JSONDecodeError, ValidationError, ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return ChatResponse(
@@ -162,7 +163,7 @@ def chat_endpoint(request: ChatRequest) -> ChatResponse:
         question=request.question.strip(),
         answer=answer.answer,
         matches=matches,
-        citations=[match.citation for match in matches],
+        citations=answer.citations,
         needs_clarification=answer.needs_clarification,
         clarification_question=answer.clarification_question,
         warnings=answer.warnings,

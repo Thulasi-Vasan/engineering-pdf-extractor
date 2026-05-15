@@ -62,7 +62,7 @@ curl -X POST http://127.0.0.1:8000/chat \
   -d '{"run_id":"<run_id>","question":"What material is specified?"}'
 ```
 
-The chat endpoint answers from `llm_final_engineering_data.json` only. It uses the LLM to create a query plan, searches the final JSON deterministically, then returns a grounded answer with citations.
+The chat endpoint answers from `llm_final_engineering_data.json` only. It sends the final JSON to the LLM with the top-level `raw_response` omitted, then returns a grounded answer with citations.
 
 Recommended `.env` for Bedrock final JSON:
 

@@ -13,7 +13,6 @@ import {
   FileText,
   Layers,
   Map,
-  MessageSquare,
   Search,
   Send,
   Table2,
@@ -30,7 +29,7 @@ interface ResultPanelProps {
   onReset: () => void;
 }
 
-type Tab = 'summary' | 'chat' | 'final_json' | 'artifacts' | 'warnings';
+type Tab = 'summary' | 'final_json' | 'artifacts' | 'warnings';
 type JsonRecord = Record<string, unknown>;
 type CellTone = 'normal' | 'muted' | 'success' | 'warning' | 'danger';
 
@@ -147,12 +146,6 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
           label="Summary"
         />
         <TabButton
-          active={activeTab === 'chat'}
-          onClick={() => setActiveTab('chat')}
-          icon={<MessageSquare className="w-4 h-4" />}
-          label="Chat"
-        />
-        <TabButton
           active={activeTab === 'final_json'}
           onClick={() => setActiveTab('final_json')}
           icon={<FileJson className="w-4 h-4" />}
@@ -175,10 +168,111 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
         />
       </div>
 
-      <div className="flex-1 overflow-hidden flex flex-col">
-        {activeTab === 'summary' && <SummaryView summary={summary} />}
+      <div className="flex-1 overflow-hidden flex flex-col xl:flex-row bg-slate-50/40">
+        <div className="min-h-0 flex-1 overflow-hidden flex flex-col">
+          {activeTab === 'summary' && <SummaryView summary={summary} />}
 
-        {activeTab === 'chat' && (
+          {activeTab === 'final_json' && (
+            <div className="flex-1 overflow-hidden flex flex-col">
+              <div className="p-3 border-b border-slate-50 bg-slate-50/30 flex items-center gap-3">
+                <div className="relative flex-1">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400" />
+                  <input
+                    type="text"
+                    placeholder="Search JSON keys or values..."
+                    className="w-full pl-9 pr-3 py-1.5 bg-white border border-slate-200 rounded-md text-xs focus:outline-none focus:ring-1 focus:ring-brand-accent transition-all"
+                    value={searchTerm}
+                    onChange={(e) => setSearchTerm(e.target.value)}
+                  />
+                </div>
+              </div>
+              <div className="flex-1 overflow-auto bg-[#1a1b26] p-2 custom-scrollbar">
+                <SyntaxHighlighter
+                  language="json"
+                  style={atomDark}
+                  customStyle={{
+                    margin: 0,
+                    background: 'transparent',
+                    fontSize: '12px',
+                    lineHeight: '1.6',
+                  }}
+                >
+                  {JSON.stringify(displayJson, null, 2)}
+                </SyntaxHighlighter>
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'artifacts' && (
+            <div className="p-5 space-y-4 overflow-auto">
+              <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
+                <BarChart4 className="w-4 h-4 text-brand-accent" />
+                Generated Artifacts
+              </h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                {Object.entries(result.artifacts).filter((entry): entry is [string, string] => Boolean(entry[1])).map(([key, path]) => {
+                  const Icon = artifactIcons[key] || FileText;
+                  return (
+                    <a
+                      key={key}
+                      href={api.getArtifactUrl(path)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="group flex items-center gap-3 p-3 rounded-lg border border-slate-200 hover:border-brand-accent/30 hover:bg-blue-50/30 transition-all"
+                    >
+                      <div className="w-9 h-9 bg-slate-100 group-hover:bg-blue-100 rounded-lg flex items-center justify-center text-slate-500 group-hover:text-brand-accent transition-colors">
+                        <Icon className="w-4.5 h-4.5" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-semibold text-slate-800 truncate">{artifactLabels[key] || key}</p>
+                        <p className="text-[10px] text-slate-400 truncate mt-0.5">{path}</p>
+                      </div>
+                      <ExternalLink className="w-4 h-4 text-slate-300 group-hover:text-brand-accent opacity-0 group-hover:opacity-100 transition-all" />
+                    </a>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'warnings' && (
+            <div className="p-5 space-y-4 overflow-auto">
+              {summary.warningCount === 0 ? (
+                <div className="flex flex-col items-center justify-center py-12 text-center">
+                  <div className="w-14 h-14 bg-emerald-50 rounded-lg flex items-center justify-center mb-4">
+                    <Check className="w-7 h-7 text-emerald-500" />
+                  </div>
+                  <h4 className="text-slate-700 font-semibold">No Warnings</h4>
+                  <p className="text-slate-400 text-sm mt-1">Extraction completed without any detected issues.</p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {summary.finalWarnings.map((warning) => (
+                    <div key={warning} className="flex gap-4 p-4 bg-amber-50 border border-amber-100 rounded-lg">
+                      <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
+                      <p className="text-sm text-amber-900 leading-relaxed">{warning}</p>
+                    </div>
+                  ))}
+                  {summary.reviewItems.map((item) => (
+                    <div key={reviewItemKey(item)} className="flex gap-4 p-4 bg-slate-50 border border-slate-200 rounded-lg">
+                      <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
+                      <div>
+                        <p className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                          {stringField(item, 'item_type') || 'Review Item'}
+                        </p>
+                        <p className="text-sm text-slate-800 leading-relaxed mt-1">
+                          {stringField(item, 'reason') || stringField(item, 'warning') || stringField(item, 'description') || formatValue(item.value)}
+                        </p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        <aside className="min-h-0 xl:w-[420px] 2xl:w-[460px] shrink-0 border-t xl:border-t-0 xl:border-l border-slate-200 bg-white">
           <ChatView
             question={chatQuestion}
             setQuestion={setChatQuestion}
@@ -187,106 +281,7 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
             error={chatError}
             onAsk={handleAskQuestion}
           />
-        )}
-
-        {activeTab === 'final_json' && (
-          <div className="flex-1 overflow-hidden flex flex-col">
-            <div className="p-3 border-b border-slate-50 bg-slate-50/30 flex items-center gap-3">
-              <div className="relative flex-1">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400" />
-                <input
-                  type="text"
-                  placeholder="Search JSON keys or values..."
-                  className="w-full pl-9 pr-3 py-1.5 bg-white border border-slate-200 rounded-md text-xs focus:outline-none focus:ring-1 focus:ring-brand-accent transition-all"
-                  value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
-                />
-              </div>
-            </div>
-            <div className="flex-1 overflow-auto bg-[#1a1b26] p-2 custom-scrollbar">
-              <SyntaxHighlighter
-                language="json"
-                style={atomDark}
-                customStyle={{
-                  margin: 0,
-                  background: 'transparent',
-                  fontSize: '12px',
-                  lineHeight: '1.6',
-                }}
-              >
-                {JSON.stringify(displayJson, null, 2)}
-              </SyntaxHighlighter>
-            </div>
-          </div>
-        )}
-
-        {activeTab === 'artifacts' && (
-          <div className="p-5 space-y-4 overflow-auto">
-            <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
-              <BarChart4 className="w-4 h-4 text-brand-accent" />
-              Generated Artifacts
-            </h3>
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-              {Object.entries(result.artifacts).filter((entry): entry is [string, string] => Boolean(entry[1])).map(([key, path]) => {
-                const Icon = artifactIcons[key] || FileText;
-                return (
-                  <a
-                    key={key}
-                    href={api.getArtifactUrl(path)}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="group flex items-center gap-3 p-3 rounded-lg border border-slate-200 hover:border-brand-accent/30 hover:bg-blue-50/30 transition-all"
-                  >
-                    <div className="w-9 h-9 bg-slate-100 group-hover:bg-blue-100 rounded-lg flex items-center justify-center text-slate-500 group-hover:text-brand-accent transition-colors">
-                      <Icon className="w-4.5 h-4.5" />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-semibold text-slate-800 truncate">{artifactLabels[key] || key}</p>
-                      <p className="text-[10px] text-slate-400 truncate mt-0.5">{path}</p>
-                    </div>
-                    <ExternalLink className="w-4 h-4 text-slate-300 group-hover:text-brand-accent opacity-0 group-hover:opacity-100 transition-all" />
-                  </a>
-                );
-              })}
-            </div>
-          </div>
-        )}
-
-        {activeTab === 'warnings' && (
-          <div className="p-5 space-y-4 overflow-auto">
-            {summary.warningCount === 0 ? (
-              <div className="flex flex-col items-center justify-center py-12 text-center">
-                <div className="w-14 h-14 bg-emerald-50 rounded-lg flex items-center justify-center mb-4">
-                  <Check className="w-7 h-7 text-emerald-500" />
-                </div>
-                <h4 className="text-slate-700 font-semibold">No Warnings</h4>
-                <p className="text-slate-400 text-sm mt-1">Extraction completed without any detected issues.</p>
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {summary.finalWarnings.map((warning) => (
-                  <div key={warning} className="flex gap-4 p-4 bg-amber-50 border border-amber-100 rounded-lg">
-                    <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
-                    <p className="text-sm text-amber-900 leading-relaxed">{warning}</p>
-                  </div>
-                ))}
-                {summary.reviewItems.map((item) => (
-                  <div key={reviewItemKey(item)} className="flex gap-4 p-4 bg-slate-50 border border-slate-200 rounded-lg">
-                    <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
-                    <div>
-                      <p className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                        {stringField(item, 'item_type') || 'Review Item'}
-                      </p>
-                      <p className="text-sm text-slate-800 leading-relaxed mt-1">
-                        {stringField(item, 'reason') || stringField(item, 'warning') || stringField(item, 'description') || formatValue(item.value)}
-                      </p>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
+        </aside>
       </div>
 
       <div className="px-5 py-3 border-t border-slate-100 bg-slate-50/30 flex items-center justify-between text-[11px] text-slate-400 font-medium">
@@ -543,12 +538,12 @@ function ChatView({
   ];
 
   return (
-    <div className="flex-1 overflow-auto bg-slate-50/40 p-5">
-      <div className="max-w-5xl mx-auto space-y-5">
+    <div className="h-full overflow-auto bg-white p-4 custom-scrollbar">
+      <div className="space-y-4">
         <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
           <SectionHeader title="Ask Final JSON" />
           <div className="p-4 space-y-4">
-            <div className="flex gap-2">
+            <div className="flex flex-col gap-2">
               <input
                 type="text"
                 value={question}
@@ -563,7 +558,7 @@ function ChatView({
                 type="button"
                 onClick={onAsk}
                 disabled={loading || !question.trim()}
-                className="btn btn-primary px-4 py-2 text-sm gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="btn btn-primary w-full px-4 py-2 text-sm gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <Send className="w-4 h-4" />
                 {loading ? 'Asking...' : 'Ask'}
@@ -622,22 +617,20 @@ function ChatView({
 
               <DataTable
                 title="Citations"
-                columns={['Section', 'Value', 'Location', 'Confidence', 'Evidence']}
+                columns={['Citation', 'Evidence']}
                 rows={response.citations.slice(0, 12).map((citation) => [
-                  cell(citation.section, {
-                    secondary: citation.target_id,
+                  cell(citation.section || citation.target_id || '-', {
+                    secondary: [
+                      citation.target_id,
+                      citation.region_id,
+                      citation.page ? `page ${citation.page}` : '',
+                      citation.confidence ? `confidence: ${citation.confidence}` : '',
+                    ].filter(Boolean).join(' · '),
                   }),
                   cell(formatValue(citation.value) || citation.label, {
-                    secondary: citation.label,
+                    secondary: citation.evidence || citation.label,
                     warnings: citation.warnings,
                   }),
-                  cell(citation.region_id || '-', {
-                    secondary: citation.page ? `page ${citation.page}` : '',
-                  }),
-                  cell(citation.confidence || '-', {
-                    tone: confidenceTone(citation.confidence),
-                  }),
-                  cell(citation.evidence || '-'),
                 ])}
                 emptyLabel="No citations were returned."
               />
