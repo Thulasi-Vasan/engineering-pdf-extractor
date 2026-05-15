@@ -18,7 +18,7 @@ from .models import (
 )
 
 
-DEFAULT_BEDROCK_VISION_MODEL = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+DEFAULT_BEDROCK_VISION_MODEL = "global.anthropic.claude-sonnet-4-6"
 
 
 def augment_dimensions_with_vision_llm(

@@ -22,6 +22,7 @@ def extract_raw_content(pdf_path: Path, detection: PageDetectionResult) -> RawEx
 
     with pdfplumber.open(str(pdf_path)) as pdf:
         for page_detection, page in zip(detection.pages, pdf.pages, strict=False):
+            page = _dedupe_page_chars(page)
             raw_text = page_detection.native_text or page.extract_text() or ""
             normalized_text = normalize_text(raw_text)
             words = _extract_words(page)
@@ -73,6 +74,16 @@ def extract_raw_content(pdf_path: Path, detection: PageDetectionResult) -> RawEx
         pages=pages,
         document_warnings=document_warnings,
     )
+
+
+def _dedupe_page_chars(page: object) -> object:
+    dedupe_chars = getattr(page, "dedupe_chars", None)
+    if not callable(dedupe_chars):
+        return page
+    try:
+        return dedupe_chars(tolerance=1, extra_attrs=("fontname", "size"))
+    except Exception:
+        return page
 
 
 def _extract_vector_primitives(pdf_path: Path) -> tuple[dict[int, list[DrawingPrimitive]], list[str]]:
@@ -301,26 +312,51 @@ def _reconstruct_lines(words: list[WordBox], page_number: int) -> list[TextLine]
 
     lines: list[TextLine] = []
     for group in groups:
-        ordered = sorted(group, key=lambda item: item.x0)
-        text = _join_line_words(ordered)
-        normalized_text, warnings = normalize_reconstructed_text(text)
-        if not normalized_text:
-            continue
-        lines.append(
-            TextLine(
-                text=text,
-                normalized_text=normalized_text,
-                x0=min(item.x0 for item in ordered),
-                top=min(item.top for item in ordered),
-                x1=max(item.x1 for item in ordered),
-                bottom=max(item.bottom for item in ordered),
-                page=page_number,
-                source="text",
-                confidence=min(item.confidence for item in ordered),
-                warnings=warnings,
+        for ordered in _split_line_word_segments(sorted(group, key=lambda item: item.x0), median_height):
+            text = _join_line_words(ordered)
+            normalized_text, warnings = normalize_reconstructed_text(text)
+            if not normalized_text:
+                continue
+            lines.append(
+                TextLine(
+                    text=text,
+                    normalized_text=normalized_text,
+                    x0=min(item.x0 for item in ordered),
+                    top=min(item.top for item in ordered),
+                    x1=max(item.x1 for item in ordered),
+                    bottom=max(item.bottom for item in ordered),
+                    page=page_number,
+                    source="text",
+                    confidence=min(item.confidence for item in ordered),
+                    warnings=warnings,
+                )
             )
-        )
     return sorted(lines, key=lambda line: (line.top, line.x0))
+
+
+def _split_line_word_segments(words: list[WordBox], median_height: float) -> list[list[WordBox]]:
+    if len(words) <= 1:
+        return [words]
+
+    segments: list[list[WordBox]] = [[words[0]]]
+    for previous, current in zip(words, words[1:], strict=False):
+        gap = current.x0 - previous.x1
+        if _line_segment_break(previous, current, gap, median_height):
+            segments.append([current])
+        else:
+            segments[-1].append(current)
+    return [segment for segment in segments if segment]
+
+
+def _line_segment_break(previous: WordBox, current: WordBox, gap: float, median_height: float) -> bool:
+    if gap <= 0:
+        return False
+    break_gap = max(42.0, median_height * 5.0)
+    if gap < break_gap:
+        return False
+    if previous.text.endswith(("/", "-", "±", "Ø")) or current.text.startswith((".", ",", ":", ";", ")", "\"", "°")):
+        return False
+    return True
 
 
 def _join_line_words(words: list[WordBox]) -> str:

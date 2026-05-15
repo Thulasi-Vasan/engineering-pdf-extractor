@@ -28,6 +28,16 @@ def main() -> int:
         default=None,
         help="Optional vision model override. For Bedrock, defaults to BEDROCK_VISION_MODEL.",
     )
+    parser.add_argument(
+        "--llm-final-json",
+        action="store_true",
+        help="Use Bedrock to generate the final downstream engineering JSON output.",
+    )
+    parser.add_argument(
+        "--llm-final-model",
+        default=None,
+        help="Optional Bedrock model override for --llm-final-json.",
+    )
     args = parser.parse_args()
 
     try:
@@ -36,6 +46,8 @@ def main() -> int:
             output_dir=args.output_dir,
             use_vision_dimensions=args.vision_dimensions,
             vision_model=args.vision_model,
+            use_llm_final_json=args.llm_final_json,
+            llm_final_model=args.llm_final_model,
         )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -45,6 +57,8 @@ def main() -> int:
     print(f"Page detection: {result.page_detection_path}")
     print(f"Raw extraction: {result.raw_extraction_path}")
     print(f"Structured data: {result.structured_data_path}")
+    if result.final_json_path:
+        print(f"Final downstream JSON: {result.final_json_path}")
     print(f"Report: {result.report_path}")
     return 0
 
