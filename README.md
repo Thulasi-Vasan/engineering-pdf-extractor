@@ -30,6 +30,14 @@ Run the backend:
 uv run uvicorn rfq_drawing_extractor.api:app --reload --host 0.0.0.0 --port 8000
 ```
 
+Run the frontend:
+
+```bash
+cd frontend
+bun install
+bun run dev
+```
+
 Health check:
 
 ```bash
@@ -45,6 +53,16 @@ curl -X POST http://127.0.0.1:8000/extract \
 ```
 
 The API returns the final downstream JSON from `llm_final_engineering_data.json` plus artifact links for page detection, raw extraction, structured extraction, final JSON, and report files.
+
+Ask a question against a completed run's final JSON:
+
+```bash
+curl -X POST http://127.0.0.1:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"run_id":"<run_id>","question":"What material is specified?"}'
+```
+
+The chat endpoint answers from `llm_final_engineering_data.json` only. It sends the final JSON to the LLM with the top-level `raw_response` omitted, then returns a grounded answer with citations.
 
 Recommended `.env` for Bedrock final JSON:
 

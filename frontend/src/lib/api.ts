@@ -29,6 +29,37 @@ export interface ExtractionResponse {
   error?: string;
 }
 
+export interface ChatCitation {
+  section: string;
+  target_id: string;
+  label: string;
+  value: unknown;
+  page: number | null;
+  region_id: string;
+  confidence: string;
+  evidence: string;
+  warnings: string[];
+}
+
+export interface ChatMatch {
+  section: string;
+  target_id: string;
+  score: number;
+  record: Record<string, unknown>;
+  citation: ChatCitation;
+}
+
+export interface ChatResponse {
+  run_id: string;
+  question: string;
+  answer: string;
+  matches: ChatMatch[];
+  citations: ChatCitation[];
+  needs_clarification: boolean;
+  clarification_question: string | null;
+  warnings: string[];
+}
+
 export const api = {
   /**
    * Check backend health
@@ -67,6 +98,26 @@ export const api = {
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
       throw new Error(errorData.detail || 'Extraction failed');
+    }
+
+    return response.json();
+  },
+
+  /**
+   * Ask a grounded question against a run's final JSON
+   */
+  async chat(runId: string, question: string): Promise<ChatResponse> {
+    const response = await fetch(`${BASE_URL}/chat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ run_id: runId, question }),
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.detail || 'Chat request failed');
     }
 
     return response.json();

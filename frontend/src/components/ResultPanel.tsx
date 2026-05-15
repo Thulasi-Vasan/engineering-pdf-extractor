@@ -14,6 +14,7 @@ import {
   Layers,
   Map,
   Search,
+  Send,
   Table2,
 } from 'lucide-react';
 import { clsx } from 'clsx';
@@ -21,7 +22,7 @@ import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { atomDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 
 import { api } from '../lib/api.ts';
-import type { ExtractionResponse } from '../lib/api.ts';
+import type { ChatResponse, ExtractionResponse } from '../lib/api.ts';
 
 interface ResultPanelProps {
   result: ExtractionResponse;
@@ -44,6 +45,10 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
   const [activeTab, setActiveTab] = useState<Tab>('summary');
   const [copied, setCopied] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
+  const [chatQuestion, setChatQuestion] = useState('');
+  const [chatResponse, setChatResponse] = useState<ChatResponse | null>(null);
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatError, setChatError] = useState('');
   const finalJsonPayload = asRecord(result.final_json)?.final_data;
   const displayJson = asRecord(finalJsonPayload) ?? asRecord(result.final_json) ?? {};
   const summary = buildSummary(displayJson, result);
@@ -64,6 +69,21 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+  };
+
+  const handleAskQuestion = async () => {
+    const question = chatQuestion.trim();
+    if (!question || chatLoading) return;
+    setChatLoading(true);
+    setChatError('');
+    try {
+      const response = await api.chat(result.run_id, question);
+      setChatResponse(response);
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : 'Chat request failed');
+    } finally {
+      setChatLoading(false);
+    }
   };
 
   const getStatusBadge = () => {
@@ -148,107 +168,120 @@ export default function ResultPanel({ result, onReset }: ResultPanelProps) {
         />
       </div>
 
-      <div className="flex-1 overflow-hidden flex flex-col">
-        {activeTab === 'summary' && <SummaryView summary={summary} />}
+      <div className="flex-1 overflow-hidden flex flex-col xl:flex-row bg-slate-50/40">
+        <div className="min-h-0 flex-1 overflow-hidden flex flex-col">
+          {activeTab === 'summary' && <SummaryView summary={summary} />}
 
-        {activeTab === 'final_json' && (
-          <div className="flex-1 overflow-hidden flex flex-col">
-            <div className="p-3 border-b border-slate-50 bg-slate-50/30 flex items-center gap-3">
-              <div className="relative flex-1">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400" />
-                <input
-                  type="text"
-                  placeholder="Search JSON keys or values..."
-                  className="w-full pl-9 pr-3 py-1.5 bg-white border border-slate-200 rounded-md text-xs focus:outline-none focus:ring-1 focus:ring-brand-accent transition-all"
-                  value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
-                />
-              </div>
-            </div>
-            <div className="flex-1 overflow-auto bg-[#1a1b26] p-2 custom-scrollbar">
-              <SyntaxHighlighter
-                language="json"
-                style={atomDark}
-                customStyle={{
-                  margin: 0,
-                  background: 'transparent',
-                  fontSize: '12px',
-                  lineHeight: '1.6',
-                }}
-              >
-                {JSON.stringify(displayJson, null, 2)}
-              </SyntaxHighlighter>
-            </div>
-          </div>
-        )}
-
-        {activeTab === 'artifacts' && (
-          <div className="p-5 space-y-4 overflow-auto">
-            <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
-              <BarChart4 className="w-4 h-4 text-brand-accent" />
-              Generated Artifacts
-            </h3>
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-              {Object.entries(result.artifacts).filter((entry): entry is [string, string] => Boolean(entry[1])).map(([key, path]) => {
-                const Icon = artifactIcons[key] || FileText;
-                return (
-                  <a
-                    key={key}
-                    href={api.getArtifactUrl(path)}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="group flex items-center gap-3 p-3 rounded-lg border border-slate-200 hover:border-brand-accent/30 hover:bg-blue-50/30 transition-all"
-                  >
-                    <div className="w-9 h-9 bg-slate-100 group-hover:bg-blue-100 rounded-lg flex items-center justify-center text-slate-500 group-hover:text-brand-accent transition-colors">
-                      <Icon className="w-4.5 h-4.5" />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-semibold text-slate-800 truncate">{artifactLabels[key] || key}</p>
-                      <p className="text-[10px] text-slate-400 truncate mt-0.5">{path}</p>
-                    </div>
-                    <ExternalLink className="w-4 h-4 text-slate-300 group-hover:text-brand-accent opacity-0 group-hover:opacity-100 transition-all" />
-                  </a>
-                );
-              })}
-            </div>
-          </div>
-        )}
-
-        {activeTab === 'warnings' && (
-          <div className="p-5 space-y-4 overflow-auto">
-            {summary.warningCount === 0 ? (
-              <div className="flex flex-col items-center justify-center py-12 text-center">
-                <div className="w-14 h-14 bg-emerald-50 rounded-lg flex items-center justify-center mb-4">
-                  <Check className="w-7 h-7 text-emerald-500" />
+          {activeTab === 'final_json' && (
+            <div className="flex-1 overflow-hidden flex flex-col">
+              <div className="p-3 border-b border-slate-50 bg-slate-50/30 flex items-center gap-3">
+                <div className="relative flex-1">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400" />
+                  <input
+                    type="text"
+                    placeholder="Search JSON keys or values..."
+                    className="w-full pl-9 pr-3 py-1.5 bg-white border border-slate-200 rounded-md text-xs focus:outline-none focus:ring-1 focus:ring-brand-accent transition-all"
+                    value={searchTerm}
+                    onChange={(e) => setSearchTerm(e.target.value)}
+                  />
                 </div>
-                <h4 className="text-slate-700 font-semibold">No Warnings</h4>
-                <p className="text-slate-400 text-sm mt-1">Extraction completed without any detected issues.</p>
               </div>
-            ) : (
-              <div className="space-y-3">
-                {summary.finalWarnings.map((warning) => (
-                  <div key={warning} className="flex gap-4 p-4 bg-amber-50 border border-amber-100 rounded-lg">
-                    <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
-                    <p className="text-sm text-amber-900 leading-relaxed">{warning}</p>
+              <div className="flex-1 overflow-auto bg-[#1a1b26] p-2 custom-scrollbar">
+                <SyntaxHighlighter
+                  language="json"
+                  style={atomDark}
+                  customStyle={{
+                    margin: 0,
+                    background: 'transparent',
+                    fontSize: '12px',
+                    lineHeight: '1.6',
+                  }}
+                >
+                  {JSON.stringify(displayJson, null, 2)}
+                </SyntaxHighlighter>
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'artifacts' && (
+            <div className="p-5 space-y-4 overflow-auto">
+              <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
+                <BarChart4 className="w-4 h-4 text-brand-accent" />
+                Generated Artifacts
+              </h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                {Object.entries(result.artifacts).filter((entry): entry is [string, string] => Boolean(entry[1])).map(([key, path]) => {
+                  const Icon = artifactIcons[key] || FileText;
+                  return (
+                    <a
+                      key={key}
+                      href={api.getArtifactUrl(path)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="group flex items-center gap-3 p-3 rounded-lg border border-slate-200 hover:border-brand-accent/30 hover:bg-blue-50/30 transition-all"
+                    >
+                      <div className="w-9 h-9 bg-slate-100 group-hover:bg-blue-100 rounded-lg flex items-center justify-center text-slate-500 group-hover:text-brand-accent transition-colors">
+                        <Icon className="w-4.5 h-4.5" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-semibold text-slate-800 truncate">{artifactLabels[key] || key}</p>
+                        <p className="text-[10px] text-slate-400 truncate mt-0.5">{path}</p>
+                      </div>
+                      <ExternalLink className="w-4 h-4 text-slate-300 group-hover:text-brand-accent opacity-0 group-hover:opacity-100 transition-all" />
+                    </a>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'warnings' && (
+            <div className="p-5 space-y-4 overflow-auto">
+              {summary.warningCount === 0 ? (
+                <div className="flex flex-col items-center justify-center py-12 text-center">
+                  <div className="w-14 h-14 bg-emerald-50 rounded-lg flex items-center justify-center mb-4">
+                    <Check className="w-7 h-7 text-emerald-500" />
                   </div>
-                ))}
-                {summary.reviewItems.map((item) => (
-                  <div key={reviewItemKey(item)} className="flex gap-4 p-4 bg-slate-50 border border-slate-200 rounded-lg">
-                    <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
-                    <div>
-                      <p className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                        {stringField(item, 'item_type') || 'Review Item'}
-                      </p>
-                      <p className="text-sm text-slate-800 leading-relaxed mt-1">
-                        {stringField(item, 'reason') || stringField(item, 'warning') || stringField(item, 'description') || formatValue(item.value)}
-                      </p>
+                  <h4 className="text-slate-700 font-semibold">No Warnings</h4>
+                  <p className="text-slate-400 text-sm mt-1">Extraction completed without any detected issues.</p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {summary.finalWarnings.map((warning) => (
+                    <div key={warning} className="flex gap-4 p-4 bg-amber-50 border border-amber-100 rounded-lg">
+                      <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
+                      <p className="text-sm text-amber-900 leading-relaxed">{warning}</p>
                     </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
+                  ))}
+                  {summary.reviewItems.map((item) => (
+                    <div key={reviewItemKey(item)} className="flex gap-4 p-4 bg-slate-50 border border-slate-200 rounded-lg">
+                      <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
+                      <div>
+                        <p className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                          {stringField(item, 'item_type') || 'Review Item'}
+                        </p>
+                        <p className="text-sm text-slate-800 leading-relaxed mt-1">
+                          {stringField(item, 'reason') || stringField(item, 'warning') || stringField(item, 'description') || formatValue(item.value)}
+                        </p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        <aside className="min-h-0 xl:w-[420px] 2xl:w-[460px] shrink-0 border-t xl:border-t-0 xl:border-l border-slate-200 bg-white">
+          <ChatView
+            question={chatQuestion}
+            setQuestion={setChatQuestion}
+            response={chatResponse}
+            loading={chatLoading}
+            error={chatError}
+            onAsk={handleAskQuestion}
+          />
+        </aside>
       </div>
 
       <div className="px-5 py-3 border-t border-slate-100 bg-slate-50/30 flex items-center justify-between text-[11px] text-slate-400 font-medium">
@@ -476,6 +509,134 @@ function SummaryView({ summary }: { summary: SummaryData }) {
           ])}
           emptyLabel="No review items returned."
         />
+      </div>
+    </div>
+  );
+}
+
+function ChatView({
+  question,
+  setQuestion,
+  response,
+  loading,
+  error,
+  onAsk,
+}: {
+  question: string;
+  setQuestion: (value: string) => void;
+  response: ChatResponse | null;
+  loading: boolean;
+  error: string;
+  onAsk: () => void;
+}) {
+  const examples = [
+    'What material is specified?',
+    'What is the diameter?',
+    'List the threads.',
+    'Are there any review items?',
+    'Which dimensions are duplicates?',
+  ];
+
+  return (
+    <div className="h-full overflow-auto bg-white p-4 custom-scrollbar">
+      <div className="space-y-4">
+        <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+          <SectionHeader title="Ask Final JSON" />
+          <div className="p-4 space-y-4">
+            <div className="flex flex-col gap-2">
+              <input
+                type="text"
+                value={question}
+                onChange={(event) => setQuestion(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') onAsk();
+                }}
+                placeholder="Ask about dimensions, material, threads, warnings, BOM items..."
+                className="flex-1 px-3 py-2 bg-white border border-slate-200 rounded-md text-sm focus:outline-none focus:ring-1 focus:ring-brand-accent"
+              />
+              <button
+                type="button"
+                onClick={onAsk}
+                disabled={loading || !question.trim()}
+                className="btn btn-primary w-full px-4 py-2 text-sm gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Send className="w-4 h-4" />
+                {loading ? 'Asking...' : 'Ask'}
+              </button>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {examples.map((example) => (
+                <button
+                  key={example}
+                  type="button"
+                  onClick={() => setQuestion(example)}
+                  className="px-2.5 py-1 rounded-md border border-slate-200 bg-slate-50 text-xs text-slate-600 hover:border-brand-accent/40 hover:text-brand-accent"
+                >
+                  {example}
+                </button>
+              ))}
+            </div>
+            <p className="text-xs text-slate-400">
+              Answers are generated from the final downstream JSON and cite matched records where available.
+            </p>
+          </div>
+        </section>
+
+        {error && (
+          <div className="flex gap-3 p-4 bg-red-50 border border-red-100 rounded-lg">
+            <AlertTriangle className="w-5 h-5 text-red-500 shrink-0 mt-0.5" />
+            <p className="text-sm text-red-800">{error}</p>
+          </div>
+        )}
+
+        {response && (
+          <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+            <SectionHeader title="Answer" />
+            <div className="p-4 space-y-4">
+              <div>
+                <p className="text-xs font-mono text-slate-400 mb-2">Q: {response.question}</p>
+                <p className="text-sm text-slate-800 leading-relaxed whitespace-pre-wrap">{response.answer}</p>
+              </div>
+
+              {response.needs_clarification && response.clarification_question && (
+                <div className="p-3 bg-amber-50 border border-amber-100 rounded-lg">
+                  <p className="text-sm text-amber-900">{response.clarification_question}</p>
+                </div>
+              )}
+
+              {response.warnings.length > 0 && (
+                <div className="space-y-2">
+                  {response.warnings.map((warning) => (
+                    <p key={warning} className="flex items-start gap-2 text-xs text-amber-700">
+                      <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                      <span>{warning}</span>
+                    </p>
+                  ))}
+                </div>
+              )}
+
+              <DataTable
+                title="Citations"
+                columns={['Citation', 'Evidence']}
+                rows={response.citations.slice(0, 12).map((citation) => [
+                  cell(citation.section || citation.target_id || '-', {
+                    secondary: [
+                      citation.target_id,
+                      citation.region_id,
+                      citation.page ? `page ${citation.page}` : '',
+                      citation.confidence ? `confidence: ${citation.confidence}` : '',
+                    ].filter(Boolean).join(' · '),
+                  }),
+                  cell(formatValue(citation.value) || citation.label, {
+                    secondary: citation.evidence || citation.label,
+                    warnings: citation.warnings,
+                  }),
+                ])}
+                emptyLabel="No citations were returned."
+              />
+            </div>
+          </section>
+        )}
       </div>
     </div>
   );

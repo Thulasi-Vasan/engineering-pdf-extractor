@@ -10,9 +10,10 @@ from uuid import uuid4
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from .agent import extract_pdf
+from .chat import ChatCitation, ChatMatch, answer_question_from_final_json, matches_from_citations
 
 
 API_OUTPUT_ROOT = Path("outputs") / "api-runs"
@@ -55,6 +56,22 @@ class ExtractResponse(BaseModel):
     status: str = "success"
     final_json: dict[str, Any] | None = None
     artifacts: ArtifactPaths
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ChatRequest(BaseModel):
+    run_id: str
+    question: str
+
+
+class ChatResponse(BaseModel):
+    run_id: str
+    question: str
+    answer: str
+    matches: list[ChatMatch] = Field(default_factory=list)
+    citations: list[ChatCitation] = Field(default_factory=list)
+    needs_clarification: bool = False
+    clarification_question: str | None = None
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -114,6 +131,42 @@ def extract_pdf_endpoint(
             report=_artifact_url(run_id, "extraction_report.md"),
         ),
         warnings=warnings,
+    )
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat_endpoint(request: ChatRequest) -> ChatResponse:
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", request.run_id):
+        raise HTTPException(status_code=404, detail="Final JSON not found for run_id.")
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="Question is required.")
+
+    final_json_path = (API_OUTPUT_ROOT / request.run_id / "outputs" / "llm_final_engineering_data.json").resolve()
+    output_root = API_OUTPUT_ROOT.resolve()
+    if output_root not in final_json_path.parents or not final_json_path.is_file():
+        raise HTTPException(status_code=404, detail="Final JSON not found for run_id.")
+
+    try:
+        final_json = _load_json(str(final_json_path))
+        if final_json is None:
+            raise ValueError("Final JSON could not be loaded.")
+        answer = answer_question_from_final_json(
+            final_json=final_json,
+            question=request.question.strip(),
+        )
+        matches = matches_from_citations(answer.citations)
+    except (json.JSONDecodeError, ValidationError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return ChatResponse(
+        run_id=request.run_id,
+        question=request.question.strip(),
+        answer=answer.answer,
+        matches=matches,
+        citations=answer.citations,
+        needs_clarification=answer.needs_clarification,
+        clarification_question=answer.clarification_question,
+        warnings=answer.warnings,
     )
 
 
