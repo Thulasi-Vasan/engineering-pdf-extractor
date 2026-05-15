@@ -22,6 +22,16 @@ The AWS account must have Amazon Bedrock model access enabled in the selected re
 
 The vision path renders PDF pages as images and asks the model for visible drawing dimensions only. Text/parser dimensions are kept as exact evidence; vision-only dimensions are added with `source: "vision_llm"`, and matching text plus vision dimensions are merged with `source: "mixed"`.
 
+## Documentation
+
+- [Current extraction flow](docs/architecture/flow.md)
+- [Pipeline architecture](docs/architecture/pipeline.md)
+- [Extraction validation issues](docs/validation/EXTRACTION_VALIDATION_ISSUES.md)
+- [Version 2 updates](docs/changelog/VERSION_2_UPDATES.md)
+- [Version 3 updates](docs/changelog/VERSION_3_UPDATES.md)
+- [PDF extraction demo plan](docs/planning/PDF_EXTRACTION_DEMO_PLAN.md)
+- [PDF comparison flow plan](docs/planning/pdf-comparison-flow-plan.md)
+
 ## FastAPI Backend
 
 Run the backend:
