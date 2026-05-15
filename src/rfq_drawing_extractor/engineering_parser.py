@@ -1331,6 +1331,13 @@ def _parse_dimensions(raw: RawExtractionResult, regions: list[DrawingRegion]) ->
             seen.add(key)
             dimensions.append(dimension)
 
+        for dimension in _dimension_rows_from_reconstructed_lines(page, regions):
+            key = (dimension.value, dimension.unit, dimension.imperial_value)
+            if key in seen:
+                continue
+            seen.add(key)
+            dimensions.append(dimension)
+
         for match in DIMENSION_PAIR_RE.finditer(page_text):
             metric = float(match.group("metric"))
             imperial = float(match.group("imperial"))
@@ -1554,6 +1561,98 @@ def _dimension_rows(
                 )
             )
     return dimensions
+
+
+def _dimension_rows_from_reconstructed_lines(page: object, regions: list[DrawingRegion]) -> list[DimensionCandidate]:
+    rows = _numeric_reconstructed_rows(page)
+    dimensions: list[DimensionCandidate] = []
+    for metric_row in rows:
+        metric_values = [item[0] for item in metric_row["items"] if not item[1]]
+        if len(metric_values) < 2:
+            continue
+        imperial_row = _nearest_imperial_row(metric_row, rows)
+        if imperial_row is None:
+            continue
+        imperial_values = [item[0] for item in imperial_row["items"] if item[1]]
+        if len(imperial_values) < len(metric_values):
+            continue
+        for metric, imperial in zip(metric_values, imperial_values, strict=False):
+            if not _valid_metric_imperial_pair(metric, imperial):
+                continue
+            evidence = f"{metric:g} ({imperial:g})"
+            dimensions.append(
+                DimensionCandidate(
+                    value=metric,
+                    unit="mm",
+                    imperial_value=imperial,
+                    role="possible_envelope",
+                    role_confidence="medium",
+                    raw_callout=evidence,
+                    normalized_callout=evidence,
+                    region_id=_dimension_region_id(regions, page, f"{metric:g}", evidence),
+                    page=getattr(page, "page_number", None),
+                    confidence="medium",
+                    evidence=evidence,
+                )
+            )
+    return dimensions
+
+
+def _numeric_reconstructed_rows(page: object) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for line in getattr(page, "reconstructed_lines", []) or []:
+        text = (getattr(line, "normalized_text", "") or getattr(line, "text", "") or "").strip()
+        parsed = _numeric_segment_value(text)
+        if parsed is None:
+            continue
+        value, parenthesized = parsed
+        top = float(getattr(line, "top", 0.0) or 0.0)
+        target = next((row for row in rows if abs(float(row["top"]) - top) <= 3.5), None)
+        item = (
+            value,
+            parenthesized,
+            float(getattr(line, "x0", 0.0) or 0.0),
+            float(getattr(line, "x1", 0.0) or 0.0),
+            text,
+        )
+        if target is None:
+            rows.append({"top": top, "items": [item]})
+        else:
+            target["items"].append(item)  # type: ignore[union-attr]
+
+    for row in rows:
+        row["items"] = sorted(row["items"], key=lambda item: item[2])  # type: ignore[index]
+    return sorted(rows, key=lambda row: float(row["top"]))
+
+
+def _numeric_segment_value(text: str) -> tuple[float, bool] | None:
+    match = re.fullmatch(r"\(?(?P<value>\d{1,4}(?:\.\d+)?)\)?", text)
+    if not match:
+        return None
+    parenthesized = text.startswith("(") and text.endswith(")")
+    try:
+        value = float(match.group("value"))
+    except ValueError:
+        return None
+    return value, parenthesized
+
+
+def _nearest_imperial_row(metric_row: dict[str, object], rows: list[dict[str, object]]) -> dict[str, object] | None:
+    metric_top = float(metric_row["top"])
+    metric_count = len([item for item in metric_row["items"] if not item[1]])  # type: ignore[index]
+    candidates: list[tuple[float, dict[str, object]]] = []
+    for row in rows:
+        if row is metric_row:
+            continue
+        distance = abs(metric_top - float(row["top"]))
+        if distance > 28.0:
+            continue
+        imperial_count = len([item for item in row["items"] if item[1]])  # type: ignore[index]
+        if imperial_count >= metric_count:
+            candidates.append((distance, row))
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda item: item[0])[0][1]
 
 
 def _quantity_from_prefix(value: str) -> int | None:
@@ -2230,30 +2329,69 @@ def _combined_lines(raw: RawExtractionResult) -> list[str]:
 
 
 def _page_parse_text(page: object) -> str:
-    text = getattr(page, "text", "") or ""
-    reconstructed = "\n".join(
-        line.normalized_text or line.text for line in getattr(page, "reconstructed_lines", []) if (line.normalized_text or line.text)
-    )
-    table_text = "\n".join(
-        " ".join(cell for cell in row if cell)
-        for table in getattr(page, "tables", [])
-        for row in table.rows
-    )
-    return "\n".join(part for part in (text, reconstructed, table_text) if part.strip())
+    return "\n".join(_page_parse_lines(page))
 
 
-def _page_parse_lines(page: object) -> list[str]:
-    lines = _lines(getattr(page, "text", "") or "")
+def _reconstructed_parse_lines(page: object) -> list[str]:
+    reconstructed: list[str] = []
     for line in getattr(page, "reconstructed_lines", []):
         value = line.normalized_text or line.text
         if value.strip():
-            lines.append(value.strip())
+            reconstructed.append(value.strip())
+    return reconstructed
+
+
+def _table_parse_lines(page: object) -> list[str]:
+    lines: list[str] = []
     for table in getattr(page, "tables", []):
         for row in table.rows:
             value = " ".join(cell.strip() for cell in row if cell.strip())
             if value:
                 lines.append(value)
     return lines
+
+
+def _native_parse_lines(page: object, reconstructed: list[str]) -> list[str]:
+    native_lines = _lines(getattr(page, "text", "") or "")
+    if not reconstructed:
+        return native_lines
+    reconstructed_keys = {_region_match_text(line) for line in reconstructed}
+    filtered: list[str] = []
+    for line in native_lines:
+        if _skip_native_line_when_reconstructed(line, reconstructed_keys):
+            continue
+        filtered.append(line)
+    return filtered
+
+
+def _skip_native_line_when_reconstructed(line: str, reconstructed_keys: set[str]) -> bool:
+    normalized = _region_match_text(line)
+    if not normalized:
+        return True
+    if normalized in reconstructed_keys:
+        return True
+    if len(line) > 120:
+        return True
+    label_count = len(re.findall(r"\b(?:model|dwg|drawn|created|approved|date|material|finish|tolerance|revision|phone|fax|email)\b", line, re.I))
+    number_count = len(re.findall(r"\d+(?:\.\d+)?", line))
+    return label_count >= 3 or number_count >= 8
+
+
+def _page_parse_lines(page: object) -> list[str]:
+    reconstructed = _reconstructed_parse_lines(page)
+    lines = reconstructed or _native_parse_lines(page, reconstructed)
+    return lines
+
+
+def _page_debug_text(page: object) -> str:
+    text = getattr(page, "text", "") or ""
+    reconstructed = "\n".join(_reconstructed_parse_lines(page))
+    table_text = "\n".join(
+        " ".join(cell for cell in row if cell)
+        for table in getattr(page, "tables", [])
+        for row in table.rows
+    )
+    return "\n".join(part for part in (text, reconstructed, table_text) if part.strip())
 
 
 def _label_values_from_lines(lines: list[str]) -> dict[str, str]:
@@ -2292,6 +2430,13 @@ def _label_fields_from_raw(raw: RawExtractionResult) -> dict[str, ExtractedField
                     value = cell.strip()
                     if not value:
                         continue
+                    stacked = _stacked_label_value(value)
+                    if stacked is not None:
+                        label, parsed_value = stacked
+                        parsed_value = _clean_label_value(label, parsed_value)
+                        if parsed_value:
+                            fields.setdefault(label, _field(parsed_value, f"{label}: {parsed_value}", "high", page.page_number))
+                        continue
                     if re.match(r"^MATERIAL\s*:", value, re.I) and "\n" in value:
                         label = "material"
                         parsed_value = value.split("\n", 1)[1].strip()
@@ -2326,6 +2471,16 @@ def _label_fields_from_raw(raw: RawExtractionResult) -> dict[str, ExtractedField
     return fields
 
 
+def _stacked_label_value(value: str) -> tuple[str, str] | None:
+    parts = [part.strip() for part in value.splitlines() if part.strip()]
+    if len(parts) < 2:
+        return None
+    label_match = re.match(r"^(?P<label>MODEL|DWG\s*No\.?|DRAWN BY|CREATED DATE|APPROVED BY|APPROVAL DATE|ITEM\s*#|CAGE|SHEET|MATERIAL)\s*:?\s*$", parts[-1], re.I)
+    if not label_match:
+        return None
+    return _normalize_label(label_match.group("label")), " ".join(parts[:-1]).strip()
+
+
 def _clean_label_value(label: str, value: str) -> str:
     value = re.sub(r"\s+", " ", value).strip(" |")
     if label == "material" and re.search(r"\b(?:adapter|this drawing|submitted)\b", value, re.I):
@@ -2339,10 +2494,16 @@ def _clean_label_value(label: str, value: str) -> str:
 
 def _generic_date(raw: RawExtractionResult) -> str:
     for page in raw.pages:
-        for line in _page_parse_lines(page):
+        lines = _page_parse_lines(page)
+        for index, line in enumerate(lines):
             match = re.search(r"(?<!CREATED )(?<!APPROVAL )\bDate\s*:?\s*(\d{1,2}/\d{1,2}/\d{2,4}|\d{8})\b", line, re.I)
             if match:
                 return match.group(1)
+            if re.search(r"\bDate\s*:?\s*$", line, re.I):
+                for candidate in lines[index + 1 : index + 5]:
+                    candidate_match = re.search(r"\b(\d{1,2}/\d{1,2}/\d{2,4}|\d{8})\b", candidate)
+                    if candidate_match:
+                        return candidate_match.group(1)
     return ""
 
 
